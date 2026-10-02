@@ -17,3 +17,9 @@ htmlcov/
 *.pem
 *.key
 secrets.json
+
+data/sources.db
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
