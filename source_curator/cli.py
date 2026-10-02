@@ -6,6 +6,7 @@ import argparse
 import sys
 
 from . import __version__
+from .feeds import FeedInfo
 from .inspector import DEFAULT_TIMEOUT, Inspection, InspectionError, inspect
 
 
@@ -39,7 +40,33 @@ def format_inspection(result: Inspection) -> str:
         ("Content-Type", result.content_type or "(not reported)"),
     ]
     width = max(len(label) for label, _ in rows)
-    return "\n".join(f"{label + ':':<{width + 1}} {value}" for label, value in rows)
+    lines = [f"{label + ':':<{width + 1}} {value}" for label, value in rows]
+    lines.append("")
+    lines.extend(format_feed(result.feed))
+    return "\n".join(lines)
+
+
+def format_feed(feed: FeedInfo) -> list[str]:
+    lines = [f"Feed found:  {'Yes' if feed.found else 'No'}"]
+    if not feed.found:
+        return lines
+
+    lines.append(f"Feed URL:    {feed.feed_url}")
+    if feed.error:
+        lines.append(f"Feed error:  {feed.error}")
+        return lines
+
+    lines.append(f"Feed title:  {feed.title or '(no title found)'}")
+    if not feed.items:
+        lines.append("Items:       (none found)")
+        return lines
+
+    lines.append(f"Items ({len(feed.items)}):")
+    for index, item in enumerate(feed.items, start=1):
+        lines.append(f"  {index}. {item.title or '(untitled)'}")
+        lines.append(f"     Link:      {item.link or '(no link)'}")
+        lines.append(f"     Published: {item.published or '(unknown)'}")
+    return lines
 
 
 def main(argv: list[str] | None = None) -> int:

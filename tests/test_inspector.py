@@ -23,6 +23,32 @@ class FakeResponse:
         self.text = text
 
 
+class FakeFeedResponse:
+    """Just enough of requests.Response for the feed fetch."""
+
+    def __init__(self, content=b"", status_code=200):
+        self.content = content
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} Client Error")
+
+
+HTML_WITH_FEED = """<html><head><title>Example Blog</title>
+<link rel="alternate" type="application/rss+xml" title="RSS" href="/feed.xml">
+</head><body></body></html>"""
+
+RSS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+<title>Example Blog</title>
+<item><title>First Post</title><link>https://blog.example.com/first</link>
+<pubDate>Wed, 01 Oct 2025 12:00:00 GMT</pubDate></item>
+<item><title>Second Post</title><link>https://blog.example.com/second</link>
+<pubDate>Tue, 30 Sep 2025 09:00:00 GMT</pubDate></item>
+</channel></rss>"""
+
+
 class ValidateUrlTests(unittest.TestCase):
     def test_accepts_http_and_https(self):
         self.assertEqual(validate_url("http://example.com"), "http://example.com")
@@ -184,6 +210,80 @@ class InspectTests(unittest.TestCase):
         with self.assertRaises(InspectionError):
             inspect("ftp://example.com")
         mock_get.assert_not_called()
+
+
+class InspectFeedIntegrationTests(unittest.TestCase):
+    """source_curator.feeds and source_curator.inspector both call the same shared
+    `requests.get`, so one patch with a side_effect sequence stands in for both the
+    page fetch and the (optional) feed fetch, in call order."""
+
+    @patch("source_curator.inspector.requests.get")
+    def test_detects_and_previews_feed(self, mock_get):
+        mock_get.side_effect = [
+            FakeResponse(url="https://blog.example.com/", text=HTML_WITH_FEED),
+            FakeFeedResponse(content=RSS_XML),
+        ]
+
+        result = inspect("https://blog.example.com")
+
+        self.assertTrue(result.feed.found)
+        self.assertEqual(result.feed.feed_url, "https://blog.example.com/feed.xml")
+        self.assertEqual(result.feed.title, "Example Blog")
+        self.assertEqual(len(result.feed.items), 2)
+        self.assertEqual(result.feed.items[0].title, "First Post")
+        self.assertEqual(result.feed.items[0].link, "https://blog.example.com/first")
+        self.assertIsNone(result.feed.error)
+
+    @patch("source_curator.inspector.requests.get")
+    def test_no_feed_link_reports_not_found_without_extra_request(self, mock_get):
+        mock_get.return_value = FakeResponse(
+            url="https://example.com/",
+            text="<html><head><title>No Feed</title></head></html>",
+        )
+
+        result = inspect("https://example.com")
+
+        self.assertFalse(result.feed.found)
+        self.assertEqual(result.feed.items, [])
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("source_curator.inspector.requests.get")
+    def test_unreachable_feed_handled_cleanly(self, mock_get):
+        mock_get.side_effect = [
+            FakeResponse(url="https://blog.example.com/", text=HTML_WITH_FEED),
+            requests.exceptions.ConnectionError("nope"),
+        ]
+
+        result = inspect("https://blog.example.com")
+
+        self.assertTrue(result.feed.found)
+        self.assertEqual(result.feed.feed_url, "https://blog.example.com/feed.xml")
+        self.assertIsNotNone(result.feed.error)
+        self.assertEqual(result.feed.items, [])
+
+    @patch("source_curator.inspector.requests.get")
+    def test_malformed_feed_handled_cleanly(self, mock_get):
+        mock_get.side_effect = [
+            FakeResponse(url="https://blog.example.com/", text=HTML_WITH_FEED),
+            FakeFeedResponse(content=b"this is not xml at all"),
+        ]
+
+        result = inspect("https://blog.example.com")
+
+        self.assertTrue(result.feed.found)
+        self.assertIsNotNone(result.feed.error)
+        self.assertEqual(result.feed.items, [])
+
+    @patch("source_curator.inspector.requests.get")
+    def test_non_html_content_skips_feed_detection(self, mock_get):
+        mock_get.return_value = FakeResponse(
+            headers={"Content-Type": "application/json"}, text='{"ok": true}'
+        )
+
+        result = inspect("https://example.com/data.json")
+
+        self.assertFalse(result.feed.found)
+        self.assertEqual(mock_get.call_count, 1)
 
 
 if __name__ == "__main__":

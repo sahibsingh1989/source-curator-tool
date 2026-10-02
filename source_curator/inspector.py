@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from .feeds import FeedInfo, find_feed
+
 USER_AGENT = "source-curator-tool/0.1 (+https://example.invalid/source-curator-tool)"
 DEFAULT_TIMEOUT = 10.0
 
@@ -26,6 +28,7 @@ class Inspection:
     domain: str
     content_type: str | None
     title: str | None
+    feed: FeedInfo
 
 
 def validate_url(url: str) -> str:
@@ -103,8 +106,10 @@ def inspect(url: str, timeout: float = DEFAULT_TIMEOUT) -> Inspection:
     content_type = response.headers.get("Content-Type")
 
     title = None
+    feed = FeedInfo(found=False)
     if _looks_like_html(content_type):
         title = extract_title(response.text)
+        feed = find_feed(response.text, final_url, timeout=timeout)
 
     return Inspection(
         requested_url=url,
@@ -113,4 +118,5 @@ def inspect(url: str, timeout: float = DEFAULT_TIMEOUT) -> Inspection:
         domain=urlparse(final_url).hostname or "",
         content_type=content_type,
         title=title,
+        feed=feed,
     )
