@@ -8,6 +8,9 @@ A small CLI that inspects a single web source and reports what the server return
   re-research the same site twice.
 - **Phase 4:** `discover` a topic to find candidate source websites via web search —
   finds candidates only; nothing is saved or approved automatically.
+- **Phase 5:** `evaluate` a topic to discover candidates, inspect each one, and rank
+  them by a transparent, explainable "curation score" — a prioritization heuristic,
+  not a trust or authority judgment, and nothing is saved automatically.
 
 ## Setup
 
@@ -196,15 +199,92 @@ An empty topic, a zero/negative `--limit`, or a search-provider failure (network
 error, rate limit, etc.) all print a one-line error to stderr and exit 1 instead of
 crashing. Zero search results print `No results found for '<topic>'.` and exit 0.
 
+### Evaluate and rank candidate sources for a topic (Phase 5)
+
+```
+py source_tool.py evaluate "stablecoin regulation" --limit 10
+```
+
+Runs the same discovery as `discover`, then automatically **inspects** each
+candidate (fetches the page with `inspect`'s logic, checks for a feed, checks the
+library for an existing save) and **ranks** them with a transparent 0-100
+"curation score" — highest first:
+
+```
+1. The GENIUS Act: A Comprehensive Guide to US Stablecoin Regulation
+   Domain:         www.paulhastings.com
+   URL:            https://www.paulhastings.com/insights/...
+   Curation score: 70/100
+   Relevance:      High
+   Reachable:      Yes
+   Feed:           No
+   Freshness:      Unknown
+   Already saved:  No
+   Why:            High query relevance; reachable; no feed detected.
+
+2. ...
+
+Raw results found:     10
+Duplicates removed:    0
+Unique source domains: 9
+```
+
+**The curation score is a prioritization heuristic for where to look first — it
+is not a trust, reliability, or authority judgment, and `evaluate` never saves or
+approves anything automatically.** It exists so you don't have to open every
+discovered link by hand; deciding whether a source is actually good is still up
+to you.
+
+**How the score is built** (see `source_curator/scoring.py` — every piece below
+is its own small, pure, testable function; no AI, no hidden or random inputs):
+
+| Factor | Max points | How it's measured |
+|---|---|---|
+| Relevance | 40 | Do the query's words appear in the search result's title, its snippet, and/or the candidate's domain/page title? Each of those 3 fields is worth 1/3 of this factor. |
+| Reachable / valid response | 20 | Did the page fetch succeed with an HTTP status in 200-399? |
+| Feed availability | 15 (5 partial) | Full points if an RSS/Atom feed was found **and** fetched successfully; partial credit if a feed link was found but couldn't be fetched/parsed; zero if no feed link exists. |
+| Freshness | 15 / 8 / 2 / 0 | From the feed's newest item date: Recent (≤30 days) / Active (≤90 days) / Old (>90 days) / Unknown (no feed, or no usable date). |
+| Machine-readable content type | 10 | Full points if the page's `Content-Type` is HTML; zero otherwise (or if unreachable). |
+
+Points are summed and rounded to one integer, 0-100. The printed "Why" line is
+built from the same reason strings the scorer attaches to each factor, e.g.
+`"High query relevance; reachable; RSS feed detected; recent feed activity."` —
+nothing in the explanation is generated separately from the score itself.
+
+**Freshness dates:** a feed item's RSS `pubDate` (RFC 822/2822) or Atom `updated`
+(ISO 8601) string is parsed into a timezone-aware UTC datetime. A date that can't
+be parsed is simply treated as missing (`Unknown`) — it never raises or aborts
+the run.
+
+**Failures are isolated per candidate:** if one candidate's page is down, times
+out, or blocks the request, it still appears in the ranked list — just reachable
+`No`, with the exact failure reason in its "Why" line and a correspondingly low
+score. One broken site never aborts the whole `evaluate` run.
+
+Options:
+
+- `--limit N` — maximum candidates to discover **and** inspect (default 10; note
+  this default differs from `discover`'s default of 20). `evaluate` never
+  inspects more than this many candidates.
+- `--timeout SECONDS` — per-candidate page/feed fetch timeout (default 10),
+  same meaning as on `inspect`/`add`.
+- `--db PATH` — database used only to mark already-saved domains (default:
+  `data/sources.db`).
+
+Empty topics, bad `--limit` values, and search-provider failures are handled the
+same way as `discover` (clean one-line error, exit 1); zero search results print
+`No results found for '<topic>'.` and exit 0.
+
 ## Tests
 
 ```
 py -m unittest discover -s tests -v
 ```
 
-Tests mock `requests.get` and the `ddgs` search call, so they never touch the
-network, and `add`/`list`/`show`/`discover` tests always point `--db` at a
-temporary SQLite file — never your real `data/sources.db`.
+Tests mock `requests.get`, the `ddgs` search call, and (for `evaluate`) the page
+inspector itself, so they never touch the network, and `add`/`list`/`show`/
+`discover`/`evaluate` tests always point `--db` at a temporary SQLite file —
+never your real `data/sources.db`.
 
 ## Layout
 
@@ -215,15 +295,19 @@ source_curator/
   feeds.py                feed link discovery, fetching, parsing (feedparser)
   library.py              SQLite-backed source library (stdlib sqlite3, no ORM)
   discovery.py            web search (ddgs) + candidate dedup/grouping
+  scoring.py              relevance/freshness/curation-score math (pure, no I/O)
+  evaluation.py           orchestrates discovery + inspection + scoring for `evaluate`
   cli.py                  argparse wiring and output formatting
 tests/
   test_inspector.py
   test_feeds.py
   test_library.py
   test_discovery.py
+  test_scoring.py
+  test_evaluation.py
   test_cli.py
 data/
-  sources.db              created on first `add`/`list`/`show`/`discover` run; gitignored
+  sources.db              created on first `add`/`list`/`show`/`discover`/`evaluate` run; gitignored
 ```
 
 ## Known limitations
@@ -255,3 +339,20 @@ Phase 4:
   saved, even if the specific URL is new.
 - No pagination/retry/backoff around the search provider — a single `--limit`
   request is made per run.
+
+Phase 5:
+- The curation score is deliberately simple and transparent — it is **not** a
+  trust, authority, or fact-check signal. A high score just means "relevant,
+  reachable, offers a feed, looks active, and is machine-readable"; a scam site
+  that happens to be all of those would still score well.
+- Freshness only looks at **feed** item dates. A page with no feed (or an
+  unreachable one) is always `Unknown` freshness, even if the page itself is
+  updated constantly.
+- Relevance is pure word-overlap (lower-cased, alphanumeric tokens) between the
+  query and the search title/snippet/domain/page title — it has no concept of
+  synonyms, phrases, or semantic meaning.
+- `evaluate` makes one HTTP request (plus, if a feed is found, one more) per
+  candidate, up to `--limit` times, every run — there is no caching between
+  runs, so re-running the same query re-fetches every candidate.
+- "One candidate per domain" (inherited from `discover`) means `evaluate` never
+  compares two pages from the same domain against each other.

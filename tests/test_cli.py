@@ -386,5 +386,136 @@ class DiscoverCommandTests(unittest.TestCase):
         self.assertIn("Already saved: No", fresh_block)
 
 
+class EvaluateCommandTests(unittest.TestCase):
+    """Tests for `evaluate`. evaluation.run_evaluation is mocked, so neither
+    search nor HTTP calls happen, and --db always points at a temp file."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmpdir.name) / "sources.db"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv + ["--db", str(self.db_path)])
+        return code, out.getvalue(), err.getvalue()
+
+    @patch("source_curator.cli.evaluation.run_evaluation")
+    def test_prints_ranked_candidates_and_summary(self, mock_run):
+        from source_curator.discovery import DiscoveryStats
+        from source_curator.evaluation import EvaluatedCandidate
+
+        mock_run.return_value = (
+            [
+                EvaluatedCandidate(
+                    rank=1,
+                    title="Great Source",
+                    domain="great.example.com",
+                    url="https://great.example.com/",
+                    score=95,
+                    relevance_label="High",
+                    reachable=True,
+                    status_code=200,
+                    feed_found=True,
+                    feed_url="https://great.example.com/feed",
+                    freshness="Recent",
+                    already_saved=False,
+                    explanation="High query relevance; reachable; RSS feed detected; recent feed activity.",
+                ),
+                EvaluatedCandidate(
+                    rank=2,
+                    title="Weak Source",
+                    domain="weak.example.com",
+                    url="https://weak.example.com/",
+                    score=10,
+                    relevance_label="None",
+                    reachable=False,
+                    status_code=None,
+                    feed_found=False,
+                    feed_url=None,
+                    freshness="Unknown",
+                    already_saved=True,
+                    explanation="No query relevance detected; unreachable; no feed detected.",
+                ),
+            ],
+            DiscoveryStats(raw_count=2, duplicate_count=0, unique_domain_count=2),
+        )
+
+        code, out, _ = self.run_main(["evaluate", "stablecoin regulation"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("1. Great Source", out)
+        self.assertIn("Curation score: 95/100", out)
+        self.assertIn("High query relevance; reachable; RSS feed detected; recent feed activity.", out)
+        self.assertIn("2. Weak Source", out)
+        self.assertIn("Already saved:  Yes", out)
+        self.assertIn("Raw results found:     2", out)
+        self.assertIn("Unique source domains: 2", out)
+        mock_run.assert_called_once_with(
+            "stablecoin regulation", limit=10, saved_domains=set(), timeout=10.0
+        )
+
+    @patch("source_curator.cli.evaluation.run_evaluation")
+    def test_default_limit_is_ten(self, mock_run):
+        from source_curator.discovery import DiscoveryStats
+
+        mock_run.return_value = ([], DiscoveryStats(0, 0, 0))
+
+        self.run_main(["evaluate", "topic"])
+
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs["limit"], 10)
+
+    @patch("source_curator.cli.evaluation.run_evaluation")
+    def test_limit_flag_is_passed_through(self, mock_run):
+        from source_curator.discovery import DiscoveryStats
+
+        mock_run.return_value = ([], DiscoveryStats(0, 0, 0))
+
+        self.run_main(["evaluate", "topic", "--limit", "5"])
+
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs["limit"], 5)
+
+    @patch("source_curator.cli.evaluation.run_evaluation")
+    def test_zero_results_reported_cleanly(self, mock_run):
+        from source_curator.discovery import DiscoveryStats
+
+        mock_run.return_value = ([], DiscoveryStats(0, 0, 0))
+
+        code, out, _ = self.run_main(["evaluate", "an obscure topic"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("No results found", out)
+
+    @patch("source_curator.cli.evaluation.run_evaluation")
+    def test_search_error_reported_without_crashing(self, mock_run):
+        from source_curator.discovery import SearchError
+
+        mock_run.side_effect = SearchError("Web search failed: rate limited")
+
+        code, _, err = self.run_main(["evaluate", "topic"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("rate limited", err)
+
+    @patch("source_curator.cli.inspect")
+    @patch("source_curator.cli.evaluation.run_evaluation")
+    def test_already_saved_domains_passed_from_library(self, mock_run, mock_inspect):
+        from source_curator.discovery import DiscoveryStats
+
+        mock_inspect.return_value = SAMPLE  # domain: example.com
+        self.run_main(["add", "https://example.com"])
+
+        mock_run.return_value = ([], DiscoveryStats(0, 0, 0))
+        self.run_main(["evaluate", "topic"])
+
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs["saved_domains"], {"example.com"})
+
+
 if __name__ == "__main__":
     unittest.main()

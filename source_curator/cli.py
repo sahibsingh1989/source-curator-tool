@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, discovery, library
+from . import __version__, discovery, evaluation, library
 from .feeds import FeedInfo
 from .inspector import DEFAULT_TIMEOUT, Inspection, InspectionError, inspect
 
@@ -72,6 +72,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Maximum raw search results to request (default: {discovery.DEFAULT_LIMIT}).",
     )
     discover_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help="Path to the SQLite database used to mark already-saved domains "
+        f"(default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate", help="Discover, inspect, and rank candidate sources for a topic."
+    )
+    evaluate_parser.add_argument("query", help="A research topic, e.g. \"stablecoin regulation\".")
+    evaluate_parser.add_argument(
+        "--limit",
+        type=int,
+        default=evaluation.DEFAULT_EVALUATE_LIMIT,
+        help=f"Maximum candidates to discover and inspect (default: {evaluation.DEFAULT_EVALUATE_LIMIT}).",
+    )
+    evaluate_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"Per-candidate page/feed fetch timeout in seconds (default: {DEFAULT_TIMEOUT:g}).",
+    )
+    evaluate_parser.add_argument(
         "--db",
         default=str(library.DEFAULT_DB_PATH),
         help="Path to the SQLite database used to mark already-saved domains "
@@ -159,6 +182,23 @@ def format_discovery_summary(stats: discovery.DiscoveryStats) -> str:
             f"Raw results found:     {stats.raw_count}",
             f"Duplicates removed:    {stats.duplicate_count}",
             f"Unique source domains: {stats.unique_domain_count}",
+        ]
+    )
+
+
+def format_evaluated_candidate(item: evaluation.EvaluatedCandidate) -> str:
+    return "\n".join(
+        [
+            f"{item.rank}. {item.title}",
+            f"   Domain:         {item.domain}",
+            f"   URL:            {item.url}",
+            f"   Curation score: {item.score}/100",
+            f"   Relevance:      {item.relevance_label}",
+            f"   Reachable:      {'Yes' if item.reachable else 'No'}",
+            f"   Feed:           {'Yes' if item.feed_found else 'No'}",
+            f"   Freshness:      {item.freshness}",
+            f"   Already saved:  {'Yes' if item.already_saved else 'No'}",
+            f"   Why:            {item.explanation}",
         ]
     )
 
@@ -268,12 +308,39 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        saved_domains = {row["domain"] for row in library.list_sources(conn)}
+    finally:
+        conn.close()
+
+    try:
+        evaluated, stats = evaluation.run_evaluation(
+            args.query, limit=args.limit, saved_domains=saved_domains, timeout=args.timeout
+        )
+    except discovery.SearchError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if not evaluated:
+        print(f"No results found for {args.query!r}.")
+        return 0
+
+    for item in evaluated:
+        print(format_evaluated_candidate(item))
+        print()
+    print(format_discovery_summary(stats))
+    return 0
+
+
 COMMANDS = {
     "inspect": cmd_inspect,
     "add": cmd_add,
     "list": cmd_list,
     "show": cmd_show,
     "discover": cmd_discover,
+    "evaluate": cmd_evaluate,
 }
 
 
