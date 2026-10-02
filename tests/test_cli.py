@@ -283,5 +283,108 @@ class LibraryCommandTests(unittest.TestCase):
         self.assertIn("no saved source with ID 999", err)
 
 
+class DiscoverCommandTests(unittest.TestCase):
+    """Tests for `discover`. search() is always mocked; already-saved marking
+    uses a temp DB so it never touches the real data/sources.db."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmpdir.name) / "sources.db"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv + ["--db", str(self.db_path)])
+        return code, out.getvalue(), err.getvalue()
+
+    @patch("source_curator.cli.discovery.search")
+    def test_prints_candidates_and_summary(self, mock_search):
+        from source_curator.discovery import SearchResult
+
+        mock_search.return_value = [
+            SearchResult("Reg News", "https://reg.example.com/a", "Snippet one", "reg.example.com"),
+            SearchResult("Reg News Dup", "https://reg.example.com/a/", "dup", "reg.example.com"),
+            SearchResult("Other Site", "https://other.example.org/x", "Snippet two", "other.example.org"),
+        ]
+
+        code, out, _ = self.run_main(["discover", "stablecoin regulation"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("1. Reg News", out)
+        self.assertIn("reg.example.com", out)
+        self.assertIn("https://reg.example.com/a", out)
+        self.assertIn("Snippet one", out)
+        self.assertIn("Already saved: No", out)
+        self.assertIn("2. Other Site", out)
+        self.assertIn("Raw results found:     3", out)
+        self.assertIn("Duplicates removed:    1", out)
+        self.assertIn("Unique source domains: 2", out)
+        mock_search.assert_called_once_with("stablecoin regulation", limit=20)
+
+    @patch("source_curator.cli.discovery.search")
+    def test_limit_flag_is_passed_through(self, mock_search):
+        mock_search.return_value = []
+
+        self.run_main(["discover", "topic", "--limit", "5"])
+
+        mock_search.assert_called_once_with("topic", limit=5)
+
+    @patch("source_curator.cli.discovery.search")
+    def test_zero_results_reported_cleanly(self, mock_search):
+        mock_search.return_value = []
+
+        code, out, _ = self.run_main(["discover", "an obscure topic"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("No results found", out)
+
+    @patch("source_curator.cli.discovery.search")
+    def test_search_error_reported_without_crashing(self, mock_search):
+        from source_curator.discovery import SearchError
+
+        mock_search.side_effect = SearchError("Web search failed: rate limited")
+
+        code, _, err = self.run_main(["discover", "topic"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("rate limited", err)
+
+    @patch("source_curator.cli.discovery.search")
+    def test_empty_query_handled_cleanly(self, mock_search):
+        from source_curator.discovery import SearchError
+
+        mock_search.side_effect = SearchError("No search topic given.")
+
+        code, _, err = self.run_main(["discover", ""])
+
+        self.assertEqual(code, 1)
+        self.assertIn("No search topic given", err)
+
+    @patch("source_curator.cli.inspect")
+    @patch("source_curator.cli.discovery.search")
+    def test_already_saved_domain_is_marked(self, mock_search, mock_inspect):
+        from source_curator.discovery import SearchResult
+
+        mock_inspect.return_value = SAMPLE  # domain: example.com
+        self.run_main(["add", "https://example.com"])
+
+        mock_search.return_value = [
+            SearchResult("Example", "https://example.com/other-page", "s", "example.com"),
+            SearchResult("Fresh", "https://fresh.example.org/", "s", "fresh.example.org"),
+        ]
+
+        code, out, _ = self.run_main(["discover", "topic"])
+
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        example_block = "\n".join(lines[lines.index("1. Example") : lines.index("1. Example") + 5])
+        fresh_block = "\n".join(lines[lines.index("2. Fresh") : lines.index("2. Fresh") + 5])
+        self.assertIn("Already saved: Yes", example_block)
+        self.assertIn("Already saved: No", fresh_block)
+
+
 if __name__ == "__main__":
     unittest.main()

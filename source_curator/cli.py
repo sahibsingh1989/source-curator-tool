@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, library
+from . import __version__, discovery, library
 from .feeds import FeedInfo
 from .inspector import DEFAULT_TIMEOUT, Inspection, InspectionError, inspect
 
@@ -59,6 +59,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--db",
         default=str(library.DEFAULT_DB_PATH),
         help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    discover_parser = subparsers.add_parser(
+        "discover", help="Search the web for candidate source websites on a topic."
+    )
+    discover_parser.add_argument("query", help="A research topic, e.g. \"stablecoin regulation\".")
+    discover_parser.add_argument(
+        "--limit",
+        type=int,
+        default=discovery.DEFAULT_LIMIT,
+        help=f"Maximum raw search results to request (default: {discovery.DEFAULT_LIMIT}).",
+    )
+    discover_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help="Path to the SQLite database used to mark already-saved domains "
+        f"(default: {library.DEFAULT_DB_PATH}).",
     )
 
     return parser
@@ -122,6 +139,28 @@ def format_source_detail(row) -> str:
     ]
     width = max(len(label) for label, _ in rows)
     return "\n".join(f"{label + ':':<{width + 1}} {value}" for label, value in rows)
+
+
+def format_candidate(candidate: discovery.Candidate) -> str:
+    lines = [
+        f"{candidate.rank}. {candidate.title}",
+        f"   Domain:  {candidate.domain or '(unknown)'}",
+        f"   URL:     {candidate.url}",
+    ]
+    if candidate.snippet:
+        lines.append(f"   Snippet: {candidate.snippet}")
+    lines.append(f"   Already saved: {'Yes' if candidate.already_saved else 'No'}")
+    return "\n".join(lines)
+
+
+def format_discovery_summary(stats: discovery.DiscoveryStats) -> str:
+    return "\n".join(
+        [
+            f"Raw results found:     {stats.raw_count}",
+            f"Duplicates removed:    {stats.duplicate_count}",
+            f"Unique source domains: {stats.unique_domain_count}",
+        ]
+    )
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -203,11 +242,38 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_discover(args: argparse.Namespace) -> int:
+    try:
+        raw_results = discovery.search(args.query, limit=args.limit)
+    except discovery.SearchError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if not raw_results:
+        print(f"No results found for {args.query!r}.")
+        return 0
+
+    conn = library.connect(args.db)
+    try:
+        saved_domains = {row["domain"] for row in library.list_sources(conn)}
+    finally:
+        conn.close()
+
+    candidates, stats = discovery.build_candidates(raw_results, saved_domains)
+
+    for candidate in candidates:
+        print(format_candidate(candidate))
+        print()
+    print(format_discovery_summary(stats))
+    return 0
+
+
 COMMANDS = {
     "inspect": cmd_inspect,
     "add": cmd_add,
     "list": cmd_list,
     "show": cmd_show,
+    "discover": cmd_discover,
 }
 
 

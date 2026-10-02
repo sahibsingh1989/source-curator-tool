@@ -6,6 +6,8 @@ A small CLI that inspects a single web source and reports what the server return
 - **Phase 2:** also detect an RSS/Atom feed linked from the page and preview recent items.
 - **Phase 3:** save inspected sources to a local SQLite library so you don't have to
   re-research the same site twice.
+- **Phase 4:** `discover` a topic to find candidate source websites via web search —
+  finds candidates only; nothing is saved or approved automatically.
 
 ## Setup
 
@@ -142,15 +144,67 @@ Added:         2026-10-02T01:23:02+00:00
 
 An unknown ID prints a one-line error to stderr and exits 1 rather than crashing.
 
+### Discover candidate sources for a topic (Phase 4)
+
+```
+py source_tool.py discover "stablecoin regulation"
+```
+
+Searches the web (via the [`ddgs`](https://pypi.org/project/ddgs/) package — no API
+key needed) for the topic, cleans up the raw results, and prints a numbered
+candidate list:
+
+```
+1. The GENIUS Act: A Comprehensive Guide to US Stablecoin Regulation
+   Domain:  www.paulhastings.com
+   URL:     https://www.paulhastings.com/insights/...
+   Snippet: The GENIUS Act, the first federal law to create a comprehensive...
+   Already saved: No
+
+2. GENIUS Act Regulations on Payment Stablecoin ... - Federal Register
+   Domain:  www.federalregister.gov
+   URL:     https://www.federalregister.gov/documents/...
+   Snippet: The Department of the Treasury proposes to issue regulations...
+   Already saved: No
+
+Raw results found:     10
+Duplicates removed:    0
+Unique source domains: 9
+```
+
+Cleanup applied before printing:
+- **Exact/trivial duplicate URLs removed** — using the same URL normalization as
+  the `add` command (trailing slash, default port, case, fragment).
+- **One candidate per domain** — if a search turns up several pages from the same
+  site, only the first is kept, so you don't see 10 articles from one domain.
+- **Already-saved marking** — each candidate's domain is checked against your
+  local source library (`--db`, same database as `add`/`list`/`show`) and marked
+  `Already saved: Yes` or `No`. This is informational only.
+
+**`discover` never saves, approves, scores, or ranks anything, and it does not
+fetch/inspect the candidate pages themselves** — it only reports what the search
+provider returned, cleaned up. Use `add <url>` afterward for any candidate you
+decide is worth keeping.
+
+Options:
+
+- `--limit N` — maximum raw search results to request (default 20).
+- `--db PATH` — database used only to mark already-saved domains (default:
+  `data/sources.db`).
+
+An empty topic, a zero/negative `--limit`, or a search-provider failure (network
+error, rate limit, etc.) all print a one-line error to stderr and exit 1 instead of
+crashing. Zero search results print `No results found for '<topic>'.` and exit 0.
+
 ## Tests
 
 ```
 py -m unittest discover -s tests -v
 ```
 
-Tests mock `requests.get`, so they never touch the network, and `add`/`list`/`show`
-tests always point `--db` at a temporary SQLite file — never your real
-`data/sources.db`.
+Tests mock `requests.get` and the `ddgs` search call, so they never touch the
+network, and `add`/`list`/`show`/`discover` tests always point `--db` at a
+temporary SQLite file — never your real `data/sources.db`.
 
 ## Layout
 
@@ -160,14 +214,16 @@ source_curator/
   inspector.py            URL validation, page fetching, title extraction
   feeds.py                feed link discovery, fetching, parsing (feedparser)
   library.py              SQLite-backed source library (stdlib sqlite3, no ORM)
+  discovery.py            web search (ddgs) + candidate dedup/grouping
   cli.py                  argparse wiring and output formatting
 tests/
   test_inspector.py
   test_feeds.py
   test_library.py
+  test_discovery.py
   test_cli.py
 data/
-  sources.db              created on first `add`/`list`/`show` run; gitignored
+  sources.db              created on first `add`/`list`/`show`/`discover` run; gitignored
 ```
 
 ## Known limitations
@@ -187,3 +243,15 @@ Phase 3:
   change it (no automatic approval, by design).
 - `list`/`show` read whatever is already in the database; they don't re-check
   that a saved source is still reachable.
+
+Phase 4:
+- `ddgs` is an unofficial, best-effort wrapper around a public search engine with
+  no API key or SLA — result counts, ranking, and availability can vary run to
+  run, and it can occasionally raise on rate limiting.
+- "One candidate per domain" keeps strictly the *first* result seen per domain,
+  not the most relevant one for the topic.
+- "Already saved" is a **domain-level** check, not an exact-URL check: if you've
+  saved any page from a domain, every candidate on that domain is marked as
+  saved, even if the specific URL is new.
+- No pagination/retry/backoff around the search provider — a single `--limit`
+  request is made per run.
