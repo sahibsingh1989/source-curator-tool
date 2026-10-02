@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help="List saved sources.")
     list_parser.add_argument(
+        "--status",
+        choices=(library.STATUS_PENDING, library.STATUS_APPROVED, library.STATUS_REJECTED),
+        help="Only list sources with this approval status.",
+    )
+    list_parser.add_argument(
         "--db",
         default=str(library.DEFAULT_DB_PATH),
         help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
@@ -101,6 +106,54 @@ def build_parser() -> argparse.ArgumentParser:
         f"(default: {library.DEFAULT_DB_PATH}).",
     )
 
+    for name, status in (
+        ("approve", library.STATUS_APPROVED),
+        ("reject", library.STATUS_REJECTED),
+        ("pending", library.STATUS_PENDING),
+    ):
+        status_parser = subparsers.add_parser(name, help=f"Mark a saved source as {status}.")
+        status_parser.add_argument("id", type=int, help="Saved source ID, from `list`.")
+        status_parser.add_argument(
+            "--db",
+            default=str(library.DEFAULT_DB_PATH),
+            help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+        )
+
+    note_parser = subparsers.add_parser("note", help="Set (replace) a saved source's curator notes.")
+    note_parser.add_argument("id", type=int, help="Saved source ID, from `list`.")
+    note_parser.add_argument("text", help="Free-text note. Quote it if it contains spaces.")
+    note_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    tag_parser = subparsers.add_parser(
+        "tag", help="Set (replace) a saved source's tags. Lower-cased, deduplicated."
+    )
+    tag_parser.add_argument("id", type=int, help="Saved source ID, from `list`.")
+    tag_parser.add_argument("tags", nargs="+", help="One or more tags.")
+    tag_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    find_parser = subparsers.add_parser(
+        "find", help="Search your saved source library locally (title, domain, URL, notes, tags)."
+    )
+    find_parser.add_argument("query", help="Search text, e.g. \"stablecoin regulation\".")
+    find_parser.add_argument(
+        "--status",
+        choices=(library.STATUS_PENDING, library.STATUS_APPROVED, library.STATUS_REJECTED),
+        help="Only search sources with this approval status.",
+    )
+    find_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
     return parser
 
 
@@ -149,6 +202,7 @@ def format_source_row(row) -> str:
 
 
 def format_source_detail(row) -> str:
+    tags = library.parse_tags(row["tags"])
     rows = [
         ("ID", str(row["id"])),
         ("Requested URL", row["requested_url"]),
@@ -158,10 +212,27 @@ def format_source_detail(row) -> str:
         ("Content-Type", row["content_type"] or "(not reported)"),
         ("Feed URL", row["feed_url"] or "(none detected)"),
         ("Status", row["status"]),
+        ("Tags", ", ".join(tags) if tags else "(none)"),
+        ("Notes", row["notes"] or "(none)"),
         ("Added", row["added_at"]),
     ]
     width = max(len(label) for label, _ in rows)
     return "\n".join(f"{label + ':':<{width + 1}} {value}" for label, value in rows)
+
+
+def format_found_source(row, score: int) -> str:
+    tags = library.parse_tags(row["tags"])
+    return "\n".join(
+        [
+            f"#{row['id']} {row['title'] or '(no title)'}",
+            f"   Domain: {row['domain']}",
+            f"   Status: {row['status']}",
+            f"   Tags:   {', '.join(tags) if tags else '(none)'}",
+            f"   Notes:  {row['notes'] or '(none)'}",
+            f"   Feed:   {'Yes' if row['feed_url'] else 'No'}",
+            f"   Score:  {score}",
+        ]
+    )
 
 
 def format_candidate(candidate: discovery.Candidate) -> str:
@@ -254,12 +325,14 @@ def cmd_add(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     conn = library.connect(args.db)
     try:
-        rows = library.list_sources(conn)
+        rows = library.list_sources(conn, status=args.status)
     finally:
         conn.close()
 
     if not rows:
-        print("No sources saved yet.")
+        print(
+            "No sources saved yet." if not args.status else f"No sources with status '{args.status}'."
+        )
         return 0
 
     for row in rows:
@@ -279,6 +352,83 @@ def cmd_show(args: argparse.Namespace) -> int:
         return 1
 
     print(format_source_detail(row))
+    return 0
+
+
+def _cmd_set_status(args: argparse.Namespace, status: str) -> int:
+    conn = library.connect(args.db)
+    try:
+        row = library.set_status(conn, args.id, status)
+    finally:
+        conn.close()
+
+    if row is None:
+        print(f"Error: no saved source with ID {args.id}", file=sys.stderr)
+        return 1
+
+    print(f"#{row['id']} {row['title'] or '(no title)'}: status -> {row['status']}")
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    return _cmd_set_status(args, library.STATUS_APPROVED)
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    return _cmd_set_status(args, library.STATUS_REJECTED)
+
+
+def cmd_pending(args: argparse.Namespace) -> int:
+    return _cmd_set_status(args, library.STATUS_PENDING)
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        row = library.set_notes(conn, args.id, args.text)
+    finally:
+        conn.close()
+
+    if row is None:
+        print(f"Error: no saved source with ID {args.id}", file=sys.stderr)
+        return 1
+
+    print(f"#{row['id']} {row['title'] or '(no title)'}: notes updated")
+    print(row["notes"] or "(empty)")
+    return 0
+
+
+def cmd_tag(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        row = library.set_tags(conn, args.id, args.tags)
+    finally:
+        conn.close()
+
+    if row is None:
+        print(f"Error: no saved source with ID {args.id}", file=sys.stderr)
+        return 1
+
+    tags = library.parse_tags(row["tags"])
+    print(f"#{row['id']} {row['title'] or '(no title)'}: tags -> {', '.join(tags) if tags else '(none)'}")
+    return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        matches = library.find_sources(conn, args.query, status=args.status)
+    finally:
+        conn.close()
+
+    if not matches:
+        print(f"No matches found for {args.query!r}.")
+        return 0
+
+    for row, score in matches:
+        print(format_found_source(row, score))
+        print()
+    print(f"Matches found: {len(matches)}")
     return 0
 
 
@@ -341,6 +491,12 @@ COMMANDS = {
     "show": cmd_show,
     "discover": cmd_discover,
     "evaluate": cmd_evaluate,
+    "approve": cmd_approve,
+    "reject": cmd_reject,
+    "pending": cmd_pending,
+    "note": cmd_note,
+    "tag": cmd_tag,
+    "find": cmd_find,
 }
 
 

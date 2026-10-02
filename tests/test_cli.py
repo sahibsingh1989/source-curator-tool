@@ -517,5 +517,183 @@ class EvaluateCommandTests(unittest.TestCase):
         self.assertEqual(kwargs["saved_domains"], {"example.com"})
 
 
+class CurationCommandTests(unittest.TestCase):
+    """Tests for approve/reject/pending/note/tag/find and `list --status`.
+    Each test gets its own temp DB file."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmpdir.name) / "sources.db"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv + ["--db", str(self.db_path)])
+        return code, out.getvalue(), err.getvalue()
+
+    def seed_one_source(self):
+        with patch("source_curator.cli.inspect", return_value=SAMPLE):
+            self.run_main(["add", "https://example.com"])
+
+    def test_approve_sets_status_and_prints_confirmation(self):
+        self.seed_one_source()
+
+        code, out, _ = self.run_main(["approve", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("status -> approved", out)
+        self.assertIn("Example Domain", out)
+
+    def test_reject_sets_status(self):
+        self.seed_one_source()
+
+        code, out, _ = self.run_main(["reject", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("status -> rejected", out)
+
+    def test_pending_resets_status(self):
+        self.seed_one_source()
+        self.run_main(["approve", "1"])
+
+        code, out, _ = self.run_main(["pending", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("status -> pending", out)
+
+    def test_approve_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(["approve", "999"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_reject_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(["reject", "999"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_pending_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(["pending", "999"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_note_sets_notes_and_prints_confirmation(self):
+        self.seed_one_source()
+
+        code, out, _ = self.run_main(["note", "1", "Useful for stablecoin regulation"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("notes updated", out)
+        self.assertIn("Useful for stablecoin regulation", out)
+
+        code, out, _ = self.run_main(["show", "1"])
+        self.assertIn("Useful for stablecoin regulation", out)
+
+    def test_note_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(["note", "999", "text"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_tag_sets_lowercased_deduped_tags(self):
+        self.seed_one_source()
+
+        code, out, _ = self.run_main(["tag", "1", "Stablecoins", "Regulation", "stablecoins"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("regulation, stablecoins", out)
+
+        code, out, _ = self.run_main(["show", "1"])
+        self.assertIn("regulation, stablecoins", out)
+
+    def test_running_tag_again_replaces_tags(self):
+        self.seed_one_source()
+        self.run_main(["tag", "1", "old", "tags"])
+
+        code, out, _ = self.run_main(["tag", "1", "new"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("tags -> new", out)
+        self.assertNotIn("old", out)
+
+    def test_tag_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(["tag", "999", "tag"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_find_returns_match_with_score(self):
+        self.seed_one_source()
+        self.run_main(["tag", "1", "stablecoins"])
+        self.run_main(["note", "1", "Covers stablecoin regulation"])
+
+        code, out, _ = self.run_main(["find", "stablecoin"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("#1 Example Domain", out)
+        self.assertIn("Score:", out)
+        self.assertIn("Matches found: 1", out)
+
+    def test_find_no_matches(self):
+        self.seed_one_source()
+
+        code, out, _ = self.run_main(["find", "nonexistentwordzzz"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("No matches found", out)
+
+    def test_find_never_touches_the_network(self):
+        # find is local-only: there is nothing to mock/patch for network or
+        # search calls, and this must still work correctly.
+        self.seed_one_source()
+
+        code, out, _ = self.run_main(["find", "example"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("#1 Example Domain", out)
+
+    def test_find_status_filter(self):
+        self.seed_one_source()  # #1, pending
+        with patch(
+            "source_curator.cli.inspect",
+            return_value=replace(
+                SAMPLE,
+                requested_url="https://other.example.com",
+                final_url="https://other.example.com/",
+                domain="other.example.com",
+                title="Other Example",
+            ),
+        ):
+            self.run_main(["add", "https://other.example.com"])  # #2, pending
+        self.run_main(["approve", "2"])
+
+        code, out, _ = self.run_main(["find", "example", "--status", "approved"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("Other Example", out)
+        self.assertNotIn("#1 Example Domain", out)
+
+    def test_list_status_filter(self):
+        self.seed_one_source()  # #1, pending
+        self.run_main(["approve", "1"])
+
+        code, out, _ = self.run_main(["list", "--status", "approved"])
+        self.assertIn("#1", out)
+
+        code, out, _ = self.run_main(["list", "--status", "pending"])
+        self.assertIn("No sources with status 'pending'.", out)
+
+    def test_list_status_filter_invalid_choice_rejected_by_argparse(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["list", "--status", "bogus", "--db", str(self.db_path)])
+        self.assertEqual(ctx.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

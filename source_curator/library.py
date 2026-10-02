@@ -15,6 +15,14 @@ from urllib.parse import urlsplit, urlunsplit
 DEFAULT_DB_PATH = Path("data") / "sources.db"
 DEFAULT_STATUS = "pending"
 
+STATUS_PENDING = "pending"
+STATUS_APPROVED = "approved"
+STATUS_REJECTED = "rejected"
+
+# New databases get notes/tags straight away via this CREATE TABLE. Databases
+# created by an older version of this tool (Phase 3, before these columns
+# existed) are brought up to date by the migration in connect() below --
+# ALTER TABLE ADD COLUMN never touches existing rows' other data.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,9 +34,31 @@ CREATE TABLE IF NOT EXISTS sources (
     content_type TEXT,
     feed_url TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
-    added_at TEXT NOT NULL
+    added_at TEXT NOT NULL,
+    notes TEXT,
+    tags TEXT
 );
 """
+
+# column_name -> the ALTER TABLE statement that adds it, for migrating a
+# database created before that column existed.
+_MIGRATIONS = {
+    "notes": "ALTER TABLE sources ADD COLUMN notes TEXT",
+    "tags": "ALTER TABLE sources ADD COLUMN tags TEXT",
+}
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add any columns introduced after a database was first created.
+
+    Safe to run every time: only adds missing columns, never drops or
+    rewrites existing ones, so existing rows and their data are untouched.
+    """
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sources)")}
+    for column, ddl in _MIGRATIONS.items():
+        if column not in existing_columns:
+            conn.execute(ddl)
+    conn.commit()
 
 
 class DuplicateSourceError(Exception):
@@ -67,6 +97,7 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute(SCHEMA)
     conn.commit()
+    _migrate_schema(conn)
     return conn
 
 
@@ -132,9 +163,104 @@ def add_source(
     return saved, same_domain
 
 
-def list_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def list_sources(conn: sqlite3.Connection, status: str | None = None) -> list[sqlite3.Row]:
+    if status:
+        return conn.execute(
+            "SELECT * FROM sources WHERE status = ? ORDER BY id", (status,)
+        ).fetchall()
     return conn.execute("SELECT * FROM sources ORDER BY id").fetchall()
 
 
 def get_source(conn: sqlite3.Connection, source_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
+
+
+def set_status(conn: sqlite3.Connection, source_id: int, status: str) -> sqlite3.Row | None:
+    """Update a saved source's approval status. Returns the updated row, or
+    None if `source_id` doesn't exist (nothing is changed in that case)."""
+    if get_source(conn, source_id) is None:
+        return None
+    conn.execute("UPDATE sources SET status = ? WHERE id = ?", (status, source_id))
+    conn.commit()
+    return get_source(conn, source_id)
+
+
+def set_notes(conn: sqlite3.Connection, source_id: int, notes: str) -> sqlite3.Row | None:
+    """Replace a saved source's curator notes. Returns the updated row, or
+    None if `source_id` doesn't exist."""
+    if get_source(conn, source_id) is None:
+        return None
+    conn.execute("UPDATE sources SET notes = ? WHERE id = ?", (notes, source_id))
+    conn.commit()
+    return get_source(conn, source_id)
+
+
+def normalize_tags(tags: list[str]) -> list[str]:
+    """Lower-case, strip, drop empties, de-duplicate, and sort a list of tags."""
+    seen: set[str] = set()
+    normalized = []
+    for raw in tags:
+        tag = (raw or "").strip().lower()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        normalized.append(tag)
+    return sorted(normalized)
+
+
+def serialize_tags(tags: list[str]) -> str:
+    return ",".join(tags)
+
+
+def parse_tags(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [tag for tag in value.split(",") if tag]
+
+
+def set_tags(conn: sqlite3.Connection, source_id: int, tags: list[str]) -> sqlite3.Row | None:
+    """Replace a saved source's tag set (normalized) with `tags`. Returns the
+    updated row, or None if `source_id` doesn't exist."""
+    if get_source(conn, source_id) is None:
+        return None
+    normalized = normalize_tags(tags)
+    conn.execute(
+        "UPDATE sources SET tags = ? WHERE id = ?", (serialize_tags(normalized), source_id)
+    )
+    conn.commit()
+    return get_source(conn, source_id)
+
+
+def find_sources(
+    conn: sqlite3.Connection, query: str, status: str | None = None
+) -> list[tuple[sqlite3.Row, int]]:
+    """Search saved sources locally (no network) across title, domain, final
+    URL, notes, and tags.
+
+    Case-insensitive, partial-text matching: each lower-cased query word that
+    appears as a substring of any searched field scores one point for that
+    field, so more matching words -- and words matching in more fields --
+    rank higher. Returns (row, score) pairs for score > 0, sorted best match
+    first, ties broken by ascending ID for a deterministic order.
+    """
+    terms = [term for term in (query or "").lower().split() if term]
+    if not terms:
+        return []
+
+    rows = list_sources(conn, status=status)
+
+    scored = []
+    for row in rows:
+        fields = (
+            (row["title"] or "").lower(),
+            (row["domain"] or "").lower(),
+            (row["final_url"] or "").lower(),
+            (row["notes"] or "").lower(),
+            (row["tags"] or "").lower(),
+        )
+        score = sum(1 for term in terms for field in fields if term in field)
+        if score > 0:
+            scored.append((row, score))
+
+    scored.sort(key=lambda pair: (-pair[1], pair[0]["id"]))
+    return scored

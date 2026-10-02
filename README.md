@@ -11,6 +11,21 @@ A small CLI that inspects a single web source and reports what the server return
 - **Phase 5:** `evaluate` a topic to discover candidates, inspect each one, and rank
   them by a transparent, explainable "curation score" — a prioritization heuristic,
   not a trust or authority judgment, and nothing is saved automatically.
+- **Phase 6:** manage your saved library — approve/reject/reset status, add notes
+  and tags, and `find` your own saved sources locally (no network).
+
+### `discover` vs. `evaluate` vs. `find` — which command do I want?
+
+These three sound similar but do different things:
+
+- **`discover`** — searches the **web** for candidate sources on a topic. Fast,
+  cheap, no page fetching. Just cleaned-up search results.
+- **`evaluate`** — also searches the web, but then **fetches and inspects every
+  candidate** and ranks them with a curation score. Slower (one or two HTTP
+  requests per candidate), more informative.
+- **`find`** — searches **only your own saved library** in SQLite. No internet
+  access at all. Use it once you've actually `add`ed sources and want to find one
+  again by title, domain, URL, notes, or tag.
 
 ## Setup
 
@@ -118,6 +133,7 @@ Options:
 
 ```
 py source_tool.py list
+py source_tool.py list --status approved
 ```
 
 ```
@@ -125,7 +141,9 @@ py source_tool.py list
 #2    Hacker News                              news.ycombinator.com           pending    Feed: Yes
 ```
 
-Prints `No sources saved yet.` when the library is empty.
+Prints `No sources saved yet.` when the library is empty, or `No sources with
+status '<status>'.` when `--status` excludes everything. `--status` must be one
+of `pending`, `approved`, `rejected`.
 
 ### Show one saved source
 
@@ -142,10 +160,81 @@ Title:         Example Domain
 Content-Type:  text/html; charset=utf-8
 Feed URL:      (none detected)
 Status:        pending
+Tags:          (none)
+Notes:         (none)
 Added:         2026-10-02T01:23:02+00:00
 ```
 
 An unknown ID prints a one-line error to stderr and exits 1 rather than crashing.
+
+### Manage saved sources: approve, reject, pending, note, tag (Phase 6)
+
+```
+py source_tool.py approve 1
+py source_tool.py reject 2
+py source_tool.py pending 1
+```
+
+Each sets the source's approval status and prints a one-line confirmation:
+
+```
+#1 Example Domain: status -> approved
+```
+
+Statuses are always exactly one of `pending` (the default when a source is
+first added), `approved`, or `rejected`. Nothing is ever approved or rejected
+**automatically** — these three commands are the only way a status changes.
+
+```
+py source_tool.py note 1 "Useful for stablecoin regulation and issuer disclosures"
+```
+
+Replaces the source's free-text curator note (stored in SQLite). Running `note`
+again replaces the previous text.
+
+```
+py source_tool.py tag 1 stablecoins regulation tokenization
+```
+
+Replaces the source's tag set. Tags are lower-cased and de-duplicated
+automatically (`Stablecoins regulation STABLECOINS` → `regulation, stablecoins`).
+**Running `tag` again replaces the entire previous tag set** — it does not add
+to it; re-tag with the full list you want.
+
+Each of `approve`/`reject`/`pending`/`note`/`tag` prints a clean one-line error
+to stderr and exits 1 for an ID that doesn't exist, instead of crashing.
+
+### Search your saved library locally (Phase 6)
+
+```
+py source_tool.py find "stablecoin regulation"
+py source_tool.py find "regulation" --status approved
+```
+
+Searches **only your local SQLite library** — title, domain, final URL, notes,
+and tags. This never touches the internet; it is unrelated to `discover`/
+`evaluate` (see the comparison near the top of this file).
+
+Matching is case-insensitive and substring-based (partial words match), and
+each query word that's found in a field scores a point for that field — so a
+source matching more of your query words, or matching in more fields, ranks
+higher. Results print best match first (ties broken by source ID, so the order
+is always deterministic):
+
+```
+#1 Example Domain
+   Domain: example.com
+   Status: approved
+   Tags:   regulation, stablecoins
+   Notes:  Useful for stablecoin regulation and issuer disclosures
+   Feed:   No
+   Score:  3
+
+Matches found: 1
+```
+
+`--status` filters to one approval status before searching. No matches prints
+`No matches found for '<query>'.` and exits 0.
 
 ### Discover candidate sources for a topic (Phase 4)
 
@@ -282,9 +371,11 @@ py -m unittest discover -s tests -v
 ```
 
 Tests mock `requests.get`, the `ddgs` search call, and (for `evaluate`) the page
-inspector itself, so they never touch the network, and `add`/`list`/`show`/
-`discover`/`evaluate` tests always point `--db` at a temporary SQLite file —
-never your real `data/sources.db`.
+inspector itself, so they never touch the network, and every library-backed
+command's tests (`add`/`list`/`show`/`discover`/`evaluate`/`approve`/`reject`/
+`pending`/`note`/`tag`/`find`) always point `--db` at a temporary SQLite file —
+never your real `data/sources.db`. `find` itself needs no network mocking at
+all, since it never leaves SQLite.
 
 ## Layout
 
@@ -293,7 +384,8 @@ source_tool.py            CLI entry point
 source_curator/
   inspector.py            URL validation, page fetching, title extraction
   feeds.py                feed link discovery, fetching, parsing (feedparser)
-  library.py              SQLite-backed source library (stdlib sqlite3, no ORM)
+  library.py              SQLite-backed source library (stdlib sqlite3, no ORM);
+                           status/notes/tags, local find(), and schema migration
   discovery.py            web search (ddgs) + candidate dedup/grouping
   scoring.py              relevance/freshness/curation-score math (pure, no I/O)
   evaluation.py           orchestrates discovery + inspection + scoring for `evaluate`
@@ -307,7 +399,7 @@ tests/
   test_evaluation.py
   test_cli.py
 data/
-  sources.db              created on first `add`/`list`/`show`/`discover`/`evaluate` run; gitignored
+  sources.db              created on first library-backed command's run; gitignored
 ```
 
 ## Known limitations
@@ -323,8 +415,9 @@ Phase 2:
 Phase 3:
 - Duplicate detection is based on a normalized **final URL** only; it will not
   notice that two different URLs happen to render the same content.
-- Approval status is always saved as `pending` — there is no command yet to
-  change it (no automatic approval, by design).
+- Approval status always starts as `pending` when a source is first added; it
+  only ever changes via the explicit `approve`/`reject`/`pending` commands
+  (Phase 6) — never automatically.
 - `list`/`show` read whatever is already in the database; they don't re-check
   that a saved source is still reachable.
 
@@ -356,3 +449,19 @@ Phase 5:
   runs, so re-running the same query re-fetches every candidate.
 - "One candidate per domain" (inherited from `discover`) means `evaluate` never
   compares two pages from the same domain against each other.
+
+Phase 6:
+- `find`'s relevance score is simple substring/word-count matching, not the
+  same tokenized-overlap scoring used in Phase 5 — the two are intentionally
+  different (one ranks *your own saved library*, the other ranks *web search
+  candidates*) and are not comparable to each other.
+- `tag` always **replaces** the full tag set; there is no "add one tag" or
+  "remove one tag" command yet — re-tag with everything you want kept.
+- `note` always replaces the full note text; there is no append mode.
+- `approve`/`reject`/`pending` don't require any particular prior status —
+  you can, for example, `reject` a source that's already `rejected` (it's a
+  no-op in effect, but not treated as an error).
+- The schema migration (`library._migrate_schema`) only ever **adds** missing
+  columns (`notes`, `tags`) to an existing `sources` table; it has no general
+  migration framework for future schema changes, and it never drops, renames,
+  or rewrites a column or any existing row's data.

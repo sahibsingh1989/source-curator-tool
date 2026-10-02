@@ -1,20 +1,31 @@
 """Tests for source_curator.library. Always uses a temporary SQLite file,
 never the real data/sources.db."""
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from source_curator.library import (
     DEFAULT_STATUS,
+    STATUS_APPROVED,
+    STATUS_PENDING,
+    STATUS_REJECTED,
     DuplicateSourceError,
     add_source,
     connect,
     find_by_domain,
     find_by_normalized_url,
+    find_sources,
     get_source,
     list_sources,
+    normalize_tags,
     normalize_url,
+    parse_tags,
+    serialize_tags,
+    set_notes,
+    set_status,
+    set_tags,
 )
 
 
@@ -222,6 +233,295 @@ class ListAndGetTests(TempDbTestCase):
 
     def test_find_by_normalized_url_missing_returns_none(self):
         self.assertIsNone(find_by_normalized_url(self.conn, normalize_url("https://nope.example.com/")))
+
+    def test_list_sources_filters_by_status(self):
+        first, _ = self.add("https://example.com/a")
+        second, _ = self.add("https://example.com/b")
+        set_status(self.conn, second["id"], STATUS_APPROVED)
+
+        pending_rows = list_sources(self.conn, status=STATUS_PENDING)
+        approved_rows = list_sources(self.conn, status=STATUS_APPROVED)
+
+        self.assertEqual([row["id"] for row in pending_rows], [first["id"]])
+        self.assertEqual([row["id"] for row in approved_rows], [second["id"]])
+
+
+class StatusChangeTests(TempDbTestCase):
+    def test_approve_changes_status(self):
+        saved, _ = self.add("https://example.com/a")
+        updated = set_status(self.conn, saved["id"], STATUS_APPROVED)
+        self.assertEqual(updated["status"], STATUS_APPROVED)
+
+    def test_reject_changes_status(self):
+        saved, _ = self.add("https://example.com/a")
+        updated = set_status(self.conn, saved["id"], STATUS_REJECTED)
+        self.assertEqual(updated["status"], STATUS_REJECTED)
+
+    def test_reset_to_pending(self):
+        saved, _ = self.add("https://example.com/a")
+        set_status(self.conn, saved["id"], STATUS_APPROVED)
+        updated = set_status(self.conn, saved["id"], STATUS_PENDING)
+        self.assertEqual(updated["status"], STATUS_PENDING)
+
+    def test_default_status_is_pending(self):
+        saved, _ = self.add("https://example.com/a")
+        self.assertEqual(saved["status"], STATUS_PENDING)
+
+    def test_nonexistent_id_returns_none_and_changes_nothing(self):
+        self.assertIsNone(set_status(self.conn, 999, STATUS_APPROVED))
+        self.assertEqual(list_sources(self.conn), [])
+
+
+class NotesTests(TempDbTestCase):
+    def test_set_notes_stores_text(self):
+        saved, _ = self.add("https://example.com/a")
+        updated = set_notes(self.conn, saved["id"], "Useful for stablecoin regulation")
+        self.assertEqual(updated["notes"], "Useful for stablecoin regulation")
+
+    def test_set_notes_replaces_previous_text(self):
+        saved, _ = self.add("https://example.com/a")
+        set_notes(self.conn, saved["id"], "First note")
+        updated = set_notes(self.conn, saved["id"], "Second note")
+        self.assertEqual(updated["notes"], "Second note")
+
+    def test_new_source_has_no_notes(self):
+        saved, _ = self.add("https://example.com/a")
+        self.assertIsNone(saved["notes"])
+
+    def test_nonexistent_id_returns_none(self):
+        self.assertIsNone(set_notes(self.conn, 999, "text"))
+
+
+class NormalizeTagsTests(unittest.TestCase):
+    def test_lowercases_tags(self):
+        self.assertEqual(normalize_tags(["Stablecoins", "REGULATION"]), ["regulation", "stablecoins"])
+
+    def test_removes_duplicates(self):
+        self.assertEqual(normalize_tags(["tag", "tag", "TAG"]), ["tag"])
+
+    def test_strips_whitespace(self):
+        self.assertEqual(normalize_tags([" tag ", "tag"]), ["tag"])
+
+    def test_drops_empty_tags(self):
+        self.assertEqual(normalize_tags(["", "  ", "tag"]), ["tag"])
+
+    def test_sorted_output_is_deterministic(self):
+        self.assertEqual(normalize_tags(["zebra", "apple", "mango"]), ["apple", "mango", "zebra"])
+
+    def test_empty_input(self):
+        self.assertEqual(normalize_tags([]), [])
+
+
+class TagSerializationTests(unittest.TestCase):
+    def test_round_trips(self):
+        tags = ["regulation", "stablecoins", "tokenization"]
+        self.assertEqual(parse_tags(serialize_tags(tags)), tags)
+
+    def test_parse_tags_none(self):
+        self.assertEqual(parse_tags(None), [])
+
+    def test_parse_tags_empty_string(self):
+        self.assertEqual(parse_tags(""), [])
+
+
+class SetTagsTests(TempDbTestCase):
+    def test_sets_normalized_tags(self):
+        saved, _ = self.add("https://example.com/a")
+        updated = set_tags(self.conn, saved["id"], ["Stablecoins", "Regulation", "stablecoins"])
+        self.assertEqual(parse_tags(updated["tags"]), ["regulation", "stablecoins"])
+
+    def test_running_tag_again_replaces_previous_set(self):
+        saved, _ = self.add("https://example.com/a")
+        set_tags(self.conn, saved["id"], ["old", "tags"])
+        updated = set_tags(self.conn, saved["id"], ["new"])
+        self.assertEqual(parse_tags(updated["tags"]), ["new"])
+
+    def test_new_source_has_no_tags(self):
+        saved, _ = self.add("https://example.com/a")
+        self.assertEqual(parse_tags(saved["tags"]), [])
+
+    def test_nonexistent_id_returns_none(self):
+        self.assertIsNone(set_tags(self.conn, 999, ["tag"]))
+
+
+class FindSourcesTests(TempDbTestCase):
+    def test_search_by_title(self):
+        saved, _ = self.add("https://example.com/a", title="Stablecoin Regulation News")
+        self.add("https://other.example.com/b", title="Cooking Recipes")
+
+        matches = find_sources(self.conn, "stablecoin")
+
+        self.assertEqual([row["id"] for row, _ in matches], [saved["id"]])
+
+    def test_search_by_domain(self):
+        saved, _ = self.add("https://regulatorynews.example.com/a", title="Untitled")
+        self.add("https://other.example.com/b", title="Untitled")
+
+        matches = find_sources(self.conn, "regulatorynews")
+
+        self.assertEqual([row["id"] for row, _ in matches], [saved["id"]])
+
+    def test_search_by_url(self):
+        saved, _ = self.add("https://example.com/stablecoin-guide", title="Guide")
+
+        matches = find_sources(self.conn, "stablecoin-guide")
+
+        self.assertEqual([row["id"] for row, _ in matches], [saved["id"]])
+
+    def test_search_by_notes(self):
+        saved, _ = self.add("https://example.com/a", title="Untitled")
+        set_notes(self.conn, saved["id"], "Useful for issuer disclosures")
+
+        matches = find_sources(self.conn, "disclosures")
+
+        self.assertEqual([row["id"] for row, _ in matches], [saved["id"]])
+
+    def test_search_by_tags(self):
+        saved, _ = self.add("https://example.com/a", title="Untitled")
+        set_tags(self.conn, saved["id"], ["stablecoins", "tokenization"])
+
+        matches = find_sources(self.conn, "tokenization")
+
+        self.assertEqual([row["id"] for row, _ in matches], [saved["id"]])
+
+    def test_case_insensitive_search(self):
+        saved, _ = self.add("https://example.com/a", title="Stablecoin Regulation")
+
+        matches = find_sources(self.conn, "STABLECOIN")
+
+        self.assertEqual([row["id"] for row, _ in matches], [saved["id"]])
+
+    def test_partial_text_match(self):
+        saved, _ = self.add("https://example.com/a", title="Stablecoins Explained")
+
+        matches = find_sources(self.conn, "stable")
+
+        self.assertEqual([row["id"] for row, _ in matches], [saved["id"]])
+
+    def test_multiple_matching_words_score_higher(self):
+        both, _ = self.add(
+            "https://example.com/a", title="Stablecoin Regulation Guide", domain="example.com"
+        )
+        one, _ = self.add(
+            "https://other.example.org/b", title="Stablecoin News", domain="other.example.org"
+        )
+
+        matches = find_sources(self.conn, "stablecoin regulation")
+        scores = {row["id"]: score for row, score in matches}
+
+        self.assertGreater(scores[both["id"]], scores[one["id"]])
+
+    def test_results_sorted_best_match_first(self):
+        weak, _ = self.add("https://weak.example.com/a", title="Stablecoin")
+        strong, _ = self.add("https://strong.example.com/b", title="Stablecoin Regulation Guide")
+
+        matches = find_sources(self.conn, "stablecoin regulation guide")
+
+        self.assertEqual([row["id"] for row, _ in matches][0], strong["id"])
+
+    def test_sort_is_deterministic_for_tied_scores(self):
+        first, _ = self.add("https://a.example.com/", title="Stablecoin")
+        second, _ = self.add("https://b.example.com/", title="Stablecoin")
+
+        matches = find_sources(self.conn, "stablecoin")
+
+        self.assertEqual([row["id"] for row, _ in matches], [first["id"], second["id"]])
+
+    def test_no_matches_returns_empty_list(self):
+        self.add("https://example.com/a", title="Cooking Recipes")
+        self.assertEqual(find_sources(self.conn, "stablecoin"), [])
+
+    def test_empty_query_returns_empty_list(self):
+        self.add("https://example.com/a", title="Stablecoin")
+        self.assertEqual(find_sources(self.conn, ""), [])
+        self.assertEqual(find_sources(self.conn, "   "), [])
+
+    def test_status_filter_restricts_search(self):
+        saved, _ = self.add("https://example.com/a", title="Stablecoin Regulation")
+        set_status(self.conn, saved["id"], STATUS_APPROVED)
+        self.add("https://other.example.com/b", title="Stablecoin Regulation")
+
+        approved_matches = find_sources(self.conn, "stablecoin", status=STATUS_APPROVED)
+
+        self.assertEqual([row["id"] for row, _ in approved_matches], [saved["id"]])
+
+
+class MigrationTests(unittest.TestCase):
+    """A database created by the Phase 3 version of this tool (no notes/tags
+    columns) must keep working and must not lose any existing data."""
+
+    def test_old_schema_database_is_migrated_without_losing_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sources.db"
+
+            # Build a Phase-3-shaped database by hand: no notes/tags columns.
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                """
+                CREATE TABLE sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    requested_url TEXT NOT NULL,
+                    final_url TEXT NOT NULL,
+                    normalized_url TEXT NOT NULL UNIQUE,
+                    domain TEXT NOT NULL,
+                    title TEXT,
+                    content_type TEXT,
+                    feed_url TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    added_at TEXT NOT NULL
+                )
+                """
+            )
+            raw.execute(
+                """
+                INSERT INTO sources
+                    (requested_url, final_url, normalized_url, domain, title,
+                     content_type, feed_url, status, added_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "https://example.com/",
+                    "https://example.com/",
+                    normalize_url("https://example.com/"),
+                    "example.com",
+                    "Pre-existing Source",
+                    "text/html",
+                    None,
+                    "approved",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            raw.commit()
+            raw.close()
+
+            # Now open it through the current connect(), which must migrate
+            # it in place.
+            conn = connect(db_path)
+            try:
+                rows = list_sources(conn)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertEqual(row["title"], "Pre-existing Source")
+                self.assertEqual(row["status"], "approved")
+                self.assertIsNone(row["notes"])
+                self.assertEqual(parse_tags(row["tags"]), [])
+
+                # The migrated database must support the new functionality.
+                updated = set_notes(conn, row["id"], "Added after migration")
+                self.assertEqual(updated["notes"], "Added after migration")
+                tagged = set_tags(conn, row["id"], ["migrated"])
+                self.assertEqual(parse_tags(tagged["tags"]), ["migrated"])
+            finally:
+                conn.close()
+
+    def test_migration_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sources.db"
+            connect(db_path).close()
+            # Reopening (and thus re-running the migration check) on an
+            # already-current database must not fail or duplicate columns.
+            conn = connect(db_path)
+            conn.close()
 
 
 if __name__ == "__main__":
