@@ -892,5 +892,203 @@ class ReviewConfigCommandTests(unittest.TestCase):
         self.assertIn("Malformed YAML", out)
 
 
+class CheckCommandTests(unittest.TestCase):
+    """Tests for check/check-all and the --health filter on list/show.
+
+    `source_curator.cli.health.check_source` is patched directly: cli.py looks
+    it up through the `health` module on every call (not a bound default
+    parameter), so this reliably intercepts it without any real HTTP or feed
+    fetching -- health.check_source's own logic is already covered by
+    test_health.py. Each test gets its own temp DB file.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmpdir.name) / "sources.db"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv + ["--db", str(self.db_path)])
+        return code, out.getvalue(), err.getvalue()
+
+    def seed_source(self, inspection=SAMPLE):
+        with patch("source_curator.cli.inspect", return_value=inspection):
+            self.run_main(["add", inspection.requested_url])
+
+    @staticmethod
+    def make_result(**overrides):
+        from source_curator.health import HEALTH_HEALTHY, HealthCheckResult
+        from source_curator.scoring import FRESH_UNKNOWN
+
+        defaults = dict(
+            checked_at="2026-10-07T00:00:00+00:00",
+            reachable=True,
+            http_status=200,
+            final_url="https://example.com/",
+            feed_found=False,
+            feed_reachable=None,
+            feed_url=None,
+            latest_feed_date=None,
+            freshness=FRESH_UNKNOWN,
+            health_status=HEALTH_HEALTHY,
+            error=None,
+        )
+        defaults.update(overrides)
+        return HealthCheckResult(**defaults)
+
+    def test_check_healthy_source_no_feed(self):
+        self.seed_source(SAMPLE)
+
+        with patch("source_curator.cli.health.check_source", return_value=self.make_result()):
+            code, out, _ = self.run_main(["check", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("Reachable:        Yes", out)
+        self.assertIn("HTTP status:      200", out)
+        self.assertIn("Health status:    HEALTHY", out)
+
+        code, out, _ = self.run_main(["show", "1"])
+        self.assertIn("Health status:", out)
+        self.assertIn("HEALTHY", out)
+        self.assertIn("Last checked:", out)
+
+    def test_check_stale_source_with_old_feed(self):
+        from source_curator.health import HEALTH_STALE
+        from source_curator.scoring import FRESH_OLD
+
+        self.seed_source(SAMPLE)
+        result = self.make_result(
+            feed_found=True,
+            feed_reachable=True,
+            feed_url="https://example.com/feed.xml",
+            freshness=FRESH_OLD,
+            health_status=HEALTH_STALE,
+        )
+
+        with patch("source_curator.cli.health.check_source", return_value=result):
+            code, out, _ = self.run_main(["check", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("Freshness:        Old", out)
+        self.assertIn("Health status:    STALE", out)
+
+    def test_check_broken_source_unreachable(self):
+        from source_curator.health import HEALTH_BROKEN
+        from source_curator.scoring import FRESH_UNKNOWN
+
+        self.seed_source(SAMPLE)
+        result = self.make_result(
+            reachable=False,
+            http_status=None,
+            final_url=None,
+            freshness=FRESH_UNKNOWN,
+            health_status=HEALTH_BROKEN,
+            error="Could not connect to https://example.com/",
+        )
+
+        with patch("source_curator.cli.health.check_source", return_value=result):
+            code, out, _ = self.run_main(["check", "1"])
+
+        self.assertEqual(code, 0)  # check succeeds even though the source itself is broken
+        self.assertIn("Reachable:        No", out)
+        self.assertIn("Health status:    BROKEN", out)
+        self.assertIn("Could not connect", out)
+
+    def test_check_broken_source_feed_failure(self):
+        from source_curator.health import HEALTH_BROKEN
+        from source_curator.scoring import FRESH_UNKNOWN
+
+        self.seed_source(SAMPLE)
+        result = self.make_result(
+            feed_found=True,
+            feed_reachable=False,
+            feed_url="https://example.com/feed.xml",
+            freshness=FRESH_UNKNOWN,
+            health_status=HEALTH_BROKEN,
+            error="Could not connect to feed URL",
+        )
+
+        with patch("source_curator.cli.health.check_source", return_value=result):
+            code, out, _ = self.run_main(["check", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("Health status:    BROKEN", out)
+
+    def test_check_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(["check", "999"])
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_check_all_one_failure_does_not_stop_the_rest(self):
+        from source_curator.health import HEALTH_BROKEN
+        from source_curator.scoring import FRESH_UNKNOWN
+
+        self.seed_source(SAMPLE)
+        other = replace(
+            SAMPLE,
+            requested_url="https://other.example.com",
+            final_url="https://other.example.com/",
+            domain="other.example.com",
+            title="Other",
+        )
+        self.seed_source(other)
+
+        healthy_result = self.make_result()
+        broken_result = self.make_result(
+            reachable=False,
+            http_status=None,
+            final_url=None,
+            freshness=FRESH_UNKNOWN,
+            health_status=HEALTH_BROKEN,
+            error="Could not connect to https://other.example.com/",
+        )
+
+        def fake_check_source(row, timeout):
+            return broken_result if row["domain"] == "other.example.com" else healthy_result
+
+        with patch("source_curator.cli.health.check_source", side_effect=fake_check_source):
+            code, out, _ = self.run_main(["check-all"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("#1", out)
+        self.assertIn("#2", out)
+        self.assertIn("HEALTHY", out)
+        self.assertIn("BROKEN", out)
+        self.assertIn("Checked 2 source(s): 1 healthy, 0 stale, 1 broken.", out)
+
+    def test_check_all_empty_library(self):
+        code, out, _ = self.run_main(["check-all"])
+        self.assertEqual(code, 0)
+        self.assertIn("No sources saved yet.", out)
+
+    def test_list_health_filter(self):
+        self.seed_source(SAMPLE)
+
+        with patch("source_curator.cli.health.check_source", return_value=self.make_result()):
+            self.run_main(["check", "1"])
+
+        code, out, _ = self.run_main(["list", "--health", "healthy"])
+        self.assertIn("#1", out)
+
+        code, out, _ = self.run_main(["list", "--health", "broken"])
+        self.assertIn("No sources with health 'broken'.", out)
+
+    def test_list_health_filter_invalid_choice_rejected_by_argparse(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                main(["list", "--health", "bogus", "--db", str(self.db_path)])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_unchecked_source_shows_never_checked_in_show(self):
+        self.seed_source(SAMPLE)
+        code, out, _ = self.run_main(["show", "1"])
+        self.assertIn("(never checked)", out)
+        self.assertIn("(unchecked)", out)
+
+
 if __name__ == "__main__":
     unittest.main()

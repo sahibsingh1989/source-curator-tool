@@ -22,11 +22,13 @@ from source_curator.library import (
     normalize_tags,
     normalize_url,
     parse_tags,
+    record_health_check,
     serialize_tags,
     set_notes,
     set_status,
     set_tags,
 )
+from source_curator.health import HEALTH_BROKEN, HEALTH_HEALTHY, HEALTH_STALE
 
 
 class TempDbTestCase(unittest.TestCase):
@@ -505,12 +507,107 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(row["status"], "approved")
                 self.assertIsNone(row["notes"])
                 self.assertEqual(parse_tags(row["tags"]), [])
+                self.assertIsNone(row["last_checked_at"])
+                self.assertIsNone(row["last_health_status"])
 
                 # The migrated database must support the new functionality.
                 updated = set_notes(conn, row["id"], "Added after migration")
                 self.assertEqual(updated["notes"], "Added after migration")
                 tagged = set_tags(conn, row["id"], ["migrated"])
                 self.assertEqual(parse_tags(tagged["tags"]), ["migrated"])
+                checked = record_health_check(
+                    conn,
+                    row["id"],
+                    checked_at="2026-10-07T00:00:00+00:00",
+                    http_status=200,
+                    reachable=True,
+                    feed_reachable=None,
+                    freshness="Unknown",
+                    health_status=HEALTH_HEALTHY,
+                    error=None,
+                )
+                self.assertEqual(checked["last_health_status"], HEALTH_HEALTHY)
+            finally:
+                conn.close()
+
+    def test_pre_phase_8_database_is_migrated_without_losing_data(self):
+        """A database with notes/tags (Phase 6) but no health columns (before
+        Phase 8) must gain the health columns without disturbing existing data."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sources.db"
+
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                """
+                CREATE TABLE sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    requested_url TEXT NOT NULL,
+                    final_url TEXT NOT NULL,
+                    normalized_url TEXT NOT NULL UNIQUE,
+                    domain TEXT NOT NULL,
+                    title TEXT,
+                    content_type TEXT,
+                    feed_url TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    added_at TEXT NOT NULL,
+                    notes TEXT,
+                    tags TEXT
+                )
+                """
+            )
+            raw.execute(
+                """
+                INSERT INTO sources
+                    (requested_url, final_url, normalized_url, domain, title,
+                     content_type, feed_url, status, added_at, notes, tags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "https://example.com/",
+                    "https://example.com/",
+                    normalize_url("https://example.com/"),
+                    "example.com",
+                    "Pre-Phase-8 Source",
+                    "text/html",
+                    None,
+                    "approved",
+                    "2026-01-01T00:00:00+00:00",
+                    "Existing curator note",
+                    "existing,tag",
+                ),
+            )
+            raw.commit()
+            raw.close()
+
+            conn = connect(db_path)
+            try:
+                rows = list_sources(conn)
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertEqual(row["title"], "Pre-Phase-8 Source")
+                self.assertEqual(row["notes"], "Existing curator note")
+                self.assertEqual(parse_tags(row["tags"]), ["existing", "tag"])
+                self.assertIsNone(row["last_checked_at"])
+                self.assertIsNone(row["last_http_status"])
+                self.assertIsNone(row["last_reachable"])
+                self.assertIsNone(row["last_feed_reachable"])
+                self.assertIsNone(row["last_freshness"])
+                self.assertIsNone(row["last_health_status"])
+                self.assertIsNone(row["last_error"])
+
+                updated = record_health_check(
+                    conn,
+                    row["id"],
+                    checked_at="2026-10-07T00:00:00+00:00",
+                    http_status=200,
+                    reachable=True,
+                    feed_reachable=None,
+                    freshness="Unknown",
+                    health_status=HEALTH_HEALTHY,
+                    error=None,
+                )
+                self.assertEqual(updated["last_health_status"], HEALTH_HEALTHY)
+                self.assertEqual(updated["notes"], "Existing curator note")
             finally:
                 conn.close()
 
@@ -522,6 +619,133 @@ class MigrationTests(unittest.TestCase):
             # already-current database must not fail or duplicate columns.
             conn = connect(db_path)
             conn.close()
+
+
+class RecordHealthCheckTests(TempDbTestCase):
+    def test_sets_all_health_fields(self):
+        saved, _ = self.add("https://example.com/a")
+
+        updated = record_health_check(
+            self.conn,
+            saved["id"],
+            checked_at="2026-10-07T00:00:00+00:00",
+            http_status=200,
+            reachable=True,
+            feed_reachable=True,
+            freshness="Recent",
+            health_status=HEALTH_HEALTHY,
+            error=None,
+        )
+
+        self.assertEqual(updated["last_checked_at"], "2026-10-07T00:00:00+00:00")
+        self.assertEqual(updated["last_http_status"], 200)
+        self.assertEqual(bool(updated["last_reachable"]), True)
+        self.assertEqual(bool(updated["last_feed_reachable"]), True)
+        self.assertEqual(updated["last_freshness"], "Recent")
+        self.assertEqual(updated["last_health_status"], HEALTH_HEALTHY)
+        self.assertIsNone(updated["last_error"])
+
+    def test_stores_broken_health_with_error(self):
+        saved, _ = self.add("https://example.com/a")
+
+        updated = record_health_check(
+            self.conn,
+            saved["id"],
+            checked_at="2026-10-07T00:00:00+00:00",
+            http_status=None,
+            reachable=False,
+            feed_reachable=None,
+            freshness="Unknown",
+            health_status=HEALTH_BROKEN,
+            error="Could not connect to https://example.com/a",
+        )
+
+        self.assertEqual(bool(updated["last_reachable"]), False)
+        self.assertIsNone(updated["last_feed_reachable"])
+        self.assertEqual(updated["last_health_status"], HEALTH_BROKEN)
+        self.assertEqual(updated["last_error"], "Could not connect to https://example.com/a")
+
+    def test_does_not_disturb_other_fields(self):
+        saved, _ = self.add("https://example.com/a", title="Original Title")
+        set_tags(self.conn, saved["id"], ["tag"])
+
+        updated = record_health_check(
+            self.conn,
+            saved["id"],
+            checked_at="2026-10-07T00:00:00+00:00",
+            http_status=200,
+            reachable=True,
+            feed_reachable=None,
+            freshness="Unknown",
+            health_status=HEALTH_HEALTHY,
+            error=None,
+        )
+
+        self.assertEqual(updated["title"], "Original Title")
+        self.assertEqual(parse_tags(updated["tags"]), ["tag"])
+
+    def test_nonexistent_id_returns_none(self):
+        self.assertIsNone(
+            record_health_check(
+                self.conn,
+                999,
+                checked_at="2026-10-07T00:00:00+00:00",
+                http_status=200,
+                reachable=True,
+                feed_reachable=None,
+                freshness="Unknown",
+                health_status=HEALTH_HEALTHY,
+                error=None,
+            )
+        )
+
+
+class ListSourcesHealthFilterTests(TempDbTestCase):
+    def _mark(self, source_id, health_status):
+        record_health_check(
+            self.conn,
+            source_id,
+            checked_at="2026-10-07T00:00:00+00:00",
+            http_status=200 if health_status != HEALTH_BROKEN else None,
+            reachable=health_status != HEALTH_BROKEN,
+            feed_reachable=None,
+            freshness="Old" if health_status == HEALTH_STALE else "Unknown",
+            health_status=health_status,
+            error=None,
+        )
+
+    def test_filters_by_health_status(self):
+        healthy, _ = self.add("https://a.example.com/")
+        stale, _ = self.add("https://b.example.com/")
+        broken, _ = self.add("https://c.example.com/")
+        self._mark(healthy["id"], HEALTH_HEALTHY)
+        self._mark(stale["id"], HEALTH_STALE)
+        self._mark(broken["id"], HEALTH_BROKEN)
+
+        self.assertEqual(
+            [row["id"] for row in list_sources(self.conn, health=HEALTH_HEALTHY)], [healthy["id"]]
+        )
+        self.assertEqual(
+            [row["id"] for row in list_sources(self.conn, health=HEALTH_STALE)], [stale["id"]]
+        )
+        self.assertEqual(
+            [row["id"] for row in list_sources(self.conn, health=HEALTH_BROKEN)], [broken["id"]]
+        )
+
+    def test_combines_with_status_filter(self):
+        row, _ = self.add("https://a.example.com/")
+        set_status(self.conn, row["id"], STATUS_APPROVED)
+        self._mark(row["id"], HEALTH_HEALTHY)
+
+        other, _ = self.add("https://b.example.com/")
+        self._mark(other["id"], HEALTH_HEALTHY)  # stays pending
+
+        matches = list_sources(self.conn, status=STATUS_APPROVED, health=HEALTH_HEALTHY)
+        self.assertEqual([r["id"] for r in matches], [row["id"]])
+
+    def test_unchecked_sources_excluded_from_any_health_filter(self):
+        self.add("https://a.example.com/")  # never checked
+        self.assertEqual(list_sources(self.conn, health=HEALTH_HEALTHY), [])
 
 
 if __name__ == "__main__":

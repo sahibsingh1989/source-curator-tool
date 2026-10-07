@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, config_export, discovery, evaluation, library, review
+from . import __version__, config_export, discovery, evaluation, health, library, review
 from .feeds import FeedInfo
 from .inspector import DEFAULT_TIMEOUT, Inspection, InspectionError, inspect
 
@@ -51,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--status",
         choices=(library.STATUS_PENDING, library.STATUS_APPROVED, library.STATUS_REJECTED),
         help="Only list sources with this approval status.",
+    )
+    list_parser.add_argument(
+        "--health",
+        choices=(health.HEALTH_HEALTHY, health.HEALTH_STALE, health.HEALTH_BROKEN),
+        help="Only list sources with this last-checked health status.",
     )
     list_parser.add_argument(
         "--db",
@@ -205,6 +210,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument("path", help="Path to a YAML config file to validate.")
 
+    check_parser = subparsers.add_parser(
+        "check", help="Re-check one saved source's reachability and feed freshness."
+    )
+    check_parser.add_argument("id", type=int, help="Saved source ID, from `list`.")
+    check_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT:g}).",
+    )
+    check_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    check_all_parser = subparsers.add_parser(
+        "check-all", help="Re-check every saved source's reachability and feed freshness."
+    )
+    check_all_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT:g}).",
+    )
+    check_all_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
     return parser
 
 
@@ -246,6 +282,13 @@ def format_feed(feed: FeedInfo) -> list[str]:
     return lines
 
 
+def _yes_no(value) -> str:
+    """Render a nullable SQLite-stored boolean (None/0/1) as -/No/Yes."""
+    if value is None:
+        return "-"
+    return "Yes" if value else "No"
+
+
 def format_source_row(row) -> str:
     feed = "Yes" if row["feed_url"] else "No"
     title = row["title"] or "(no title)"
@@ -266,7 +309,21 @@ def format_source_detail(row) -> str:
         ("Tags", ", ".join(tags) if tags else "(none)"),
         ("Notes", row["notes"] or "(none)"),
         ("Added", row["added_at"]),
+        ("Last checked", row["last_checked_at"] or "(never checked)"),
+        (
+            "Last HTTP status",
+            str(row["last_http_status"]) if row["last_http_status"] is not None else "(n/a)",
+        ),
+        ("Last reachable", _yes_no(row["last_reachable"])),
+        ("Last feed reachable", _yes_no(row["last_feed_reachable"])),
+        ("Last freshness", row["last_freshness"] or "(n/a)"),
+        (
+            "Health status",
+            row["last_health_status"].upper() if row["last_health_status"] else "(unchecked)",
+        ),
     ]
+    if row["last_error"]:
+        rows.append(("Last error", row["last_error"]))
     width = max(len(label) for label, _ in rows)
     return "\n".join(f"{label + ':':<{width + 1}} {value}" for label, value in rows)
 
@@ -376,14 +433,19 @@ def cmd_add(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     conn = library.connect(args.db)
     try:
-        rows = library.list_sources(conn, status=args.status)
+        rows = library.list_sources(conn, status=args.status, health=args.health)
     finally:
         conn.close()
 
     if not rows:
-        print(
-            "No sources saved yet." if not args.status else f"No sources with status '{args.status}'."
-        )
+        if args.status and args.health:
+            print(f"No sources with status '{args.status}' and health '{args.health}'.")
+        elif args.status:
+            print(f"No sources with status '{args.status}'.")
+        elif args.health:
+            print(f"No sources with health '{args.health}'.")
+        else:
+            print("No sources saved yet.")
         return 0
 
     for row in rows:
@@ -563,6 +625,95 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
     return 1
 
 
+def format_health_check(row, result: health.HealthCheckResult) -> str:
+    lines = [
+        f"#{row['id']} {row['title'] or row['domain']}",
+        f"   Reachable:        {'Yes' if result.reachable else 'No'}",
+        f"   HTTP status:      {result.http_status if result.http_status is not None else '(none)'}",
+        f"   Final URL:        {result.final_url or '(unreachable)'}",
+        f"   Feed found:       {'Yes' if result.feed_found else 'No'}",
+        f"   Feed reachable:   {_yes_no(result.feed_reachable) if result.feed_found else '(n/a)'}",
+        f"   Latest feed item: {result.latest_feed_date or '(unknown)'}",
+        f"   Freshness:        {result.freshness}",
+        f"   Health status:    {result.health_status.upper()}",
+        f"   Last checked:     {result.checked_at}",
+    ]
+    if result.error:
+        lines.append(f"   Error:            {result.error}")
+    return "\n".join(lines)
+
+
+def format_health_row(row) -> str:
+    title = row["title"] or row["domain"]
+    status_code = row["last_http_status"] if row["last_http_status"] is not None else "-"
+    reachable = _yes_no(row["last_reachable"])
+    feed = "Yes" if row["feed_url"] else "No"
+    freshness = row["last_freshness"] or "-"
+    health_status = (row["last_health_status"] or "-").upper()
+    return (
+        f"#{row['id']:<4} {title:<30.30} {str(status_code):<6} "
+        f"{reachable:<5} {feed:<5} {freshness:<10} {health_status}"
+    )
+
+
+def _run_health_check(conn, row, timeout: float):
+    result = health.check_source(row, timeout=timeout)
+    updated = library.record_health_check(
+        conn,
+        row["id"],
+        checked_at=result.checked_at,
+        http_status=result.http_status,
+        reachable=result.reachable,
+        feed_reachable=result.feed_reachable,
+        freshness=result.freshness,
+        health_status=result.health_status,
+        error=result.error,
+    )
+    return updated, result
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        row = library.get_source(conn, args.id)
+        if row is None:
+            print(f"Error: no saved source with ID {args.id}", file=sys.stderr)
+            return 1
+        updated, result = _run_health_check(conn, row, args.timeout)
+    finally:
+        conn.close()
+
+    print(format_health_check(updated, result))
+    return 0
+
+
+def cmd_check_all(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        rows = library.list_sources(conn)
+        checked = [_run_health_check(conn, row, args.timeout)[0] for row in rows]
+    finally:
+        conn.close()
+
+    if not checked:
+        print("No sources saved yet.")
+        return 0
+
+    for row in checked:
+        print(format_health_row(row))
+
+    counts = {status: 0 for status in (health.HEALTH_HEALTHY, health.HEALTH_STALE, health.HEALTH_BROKEN)}
+    for row in checked:
+        counts[row["last_health_status"]] = counts.get(row["last_health_status"], 0) + 1
+    print(
+        f"Checked {len(checked)} source(s): "
+        f"{counts[health.HEALTH_HEALTHY]} healthy, "
+        f"{counts[health.HEALTH_STALE]} stale, "
+        f"{counts[health.HEALTH_BROKEN]} broken."
+    )
+    return 0
+
+
 def cmd_discover(args: argparse.Namespace) -> int:
     try:
         raw_results = discovery.search(args.query, limit=args.limit)
@@ -632,6 +783,8 @@ COMMANDS = {
     "config": cmd_config,
     "export-approved": cmd_export_approved,
     "validate-config": cmd_validate_config,
+    "check": cmd_check,
+    "check-all": cmd_check_all,
 }
 
 

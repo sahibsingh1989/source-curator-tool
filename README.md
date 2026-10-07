@@ -15,6 +15,9 @@ A small CLI that inspects a single web source and reports what the server return
   and tags, and `find` your own saved sources locally (no network).
 - **Phase 7:** generate a Markdown review and a YAML config entry from a saved
   source, and export/validate those YAML config files.
+- **Phase 8:** `check`/`check-all` re-visit saved sources and record whether
+  they're still reachable and whether their feed is stale — a technical
+  **health** signal, not a trust or quality judgment.
 
 ### `discover` vs. `evaluate` vs. `find` — which command do I want?
 
@@ -136,6 +139,8 @@ Options:
 ```
 py source_tool.py list
 py source_tool.py list --status approved
+py source_tool.py list --health stale
+py source_tool.py list --status approved --health broken
 ```
 
 ```
@@ -143,9 +148,12 @@ py source_tool.py list --status approved
 #2    Hacker News                              news.ycombinator.com           pending    Feed: Yes
 ```
 
-Prints `No sources saved yet.` when the library is empty, or `No sources with
-status '<status>'.` when `--status` excludes everything. `--status` must be one
-of `pending`, `approved`, `rejected`.
+Prints `No sources saved yet.` when the library is empty, or a message naming
+whichever of `--status`/`--health` excluded everything. `--status` must be one
+of `pending`/`approved`/`rejected`; `--health` (Phase 8 — see below) must be
+one of `healthy`/`stale`/`broken`, and reflects whatever `check`/`check-all`
+last recorded (a never-checked source matches neither). The two filters can be
+combined.
 
 ### Show one saved source
 
@@ -154,20 +162,29 @@ py source_tool.py show 1
 ```
 
 ```
-ID:            1
-Requested URL: https://example.com
-Final URL:     https://example.com/
-Domain:        example.com
-Title:         Example Domain
-Content-Type:  text/html; charset=utf-8
-Feed URL:      (none detected)
-Status:        pending
-Tags:          (none)
-Notes:         (none)
-Added:         2026-10-02T01:23:02+00:00
+ID:                  1
+Requested URL:       https://example.com
+Final URL:           https://example.com/
+Domain:              example.com
+Title:               Example Domain
+Content-Type:        text/html; charset=utf-8
+Feed URL:            (none detected)
+Status:              pending
+Tags:                (none)
+Notes:               (none)
+Added:               2026-10-02T01:23:02+00:00
+Last checked:        2026-10-07T04:32:48+00:00
+Last HTTP status:    200
+Last reachable:      Yes
+Last feed reachable: -
+Last freshness:      Unknown
+Health status:       HEALTHY
 ```
 
-An unknown ID prints a one-line error to stderr and exits 1 rather than crashing.
+The `Last checked` through `Health status` rows are Phase 8's stored health
+data; before the first `check`/`check-all`, they read `(never checked)` /
+`(n/a)` / `-` / `(unchecked)`. An unknown ID prints a one-line error to stderr
+and exits 1 rather than crashing.
 
 ### Manage saved sources: approve, reject, pending, note, tag (Phase 6)
 
@@ -358,6 +375,81 @@ Field order is always the same (as above), and the file is always a YAML
 a one-item list — so any config file this tool produces can always be
 concatenated or compared without reshaping.
 
+### Re-check a saved source's health (Phase 8)
+
+```
+py source_tool.py check 1
+```
+
+Re-fetches the source's stored final URL (the same inspection logic as
+`inspect`/`add`), re-checks its feed if it has one, and **persists** what it
+finds in SQLite — this is the only thing that updates a source's health data.
+
+```
+#1 Example Domain
+   Reachable:        Yes
+   HTTP status:      200
+   Final URL:        https://example.com/
+   Feed found:       No
+   Feed reachable:   (n/a)
+   Latest feed item: (unknown)
+   Freshness:        Unknown
+   Health status:    HEALTHY
+   Last checked:     2026-10-07T04:32:48+00:00
+```
+
+**"Health" here is purely technical — reachable? feed working? feed recently
+updated? It says nothing about whether a source is trustworthy, accurate, or
+worth keeping.** A perfectly healthy source can still be a bad one, and a
+temporarily-unreachable source isn't necessarily broken for good.
+
+### Re-check every saved source (Phase 8)
+
+```
+py source_tool.py check-all
+```
+
+Runs the same check against every saved source and prints a compact table —
+one failing source never stops the rest from being checked:
+
+```
+#1    Example Domain                 200    Yes   No    Unknown    HEALTHY
+#2    Internet Assigned Numbers Auth 200    Yes   No    Unknown    HEALTHY
+#3    Hacker News                    200    Yes   Yes   Recent     HEALTHY
+Checked 3 source(s): 3 healthy, 0 stale, 0 broken.
+```
+
+Columns are ID, title/domain, last HTTP status, reachable, feed present,
+freshness, and health status.
+
+### Health classification (Phase 8)
+
+Deterministic, based only on what the check just observed — three buckets,
+checked in this order (`source_curator/health.py`, function `classify_health`):
+
+1. **BROKEN** — the page itself could not be reached, **or** a feed link was
+   found on the page but fetching/parsing that feed failed.
+2. **STALE** — the page is reachable, a feed exists and was fetched
+   successfully, but its newest usable item date is more than 90 days old.
+3. **HEALTHY** — reachable, with no feed failure, and freshness is Recent
+   (≤30 days), Active (≤90 days), **or** Unknown (no feed, or no usable date
+   in it) — everything that isn't BROKEN or STALE.
+
+Freshness itself reuses the exact Phase 5 logic (`scoring.classify_freshness`)
+— same thresholds, same UTC-aware date parsing, same "malformed dates become
+Unknown, never a crash" behavior.
+
+Options for both `check` and `check-all`:
+
+- `--timeout SECONDS` — same meaning as `inspect`/`add` (default 10).
+- `--db PATH` — same meaning as everywhere else.
+
+`check <id>` on an unknown ID prints a clean error and exits 1; `check-all` on
+an empty library prints `No sources saved yet.` and exits 0. Every stored
+health field (`last_checked_at`, `last_http_status`, `last_reachable`,
+`last_feed_reachable`, `last_freshness`, `last_health_status`, `last_error`)
+is visible via `show` and filterable via `list --health`.
+
 ### Discover candidate sources for a topic (Phase 4)
 
 ```
@@ -492,11 +584,12 @@ same way as `discover` (clean one-line error, exit 1); zero search results print
 py -m unittest discover -s tests -v
 ```
 
-Tests mock `requests.get`, the `ddgs` search call, and (for `evaluate`) the page
-inspector itself, so they never touch the network, and every library-backed
-command's tests (`add`/`list`/`show`/`discover`/`evaluate`/`approve`/`reject`/
-`pending`/`note`/`tag`/`find`/`review`/`config`/`export-approved`) always point
-`--db` at a temporary SQLite file — never your real `data/sources.db` — and
+Tests mock `requests.get`, the `ddgs` search call, and (for `evaluate`,
+`check`/`check-all`) the page inspector itself, so they never touch the
+network, and every library-backed command's tests (`add`/`list`/`show`/
+`discover`/`evaluate`/`approve`/`reject`/`pending`/`note`/`tag`/`find`/
+`review`/`config`/`export-approved`/`check`/`check-all`) always point `--db`
+at a temporary SQLite file — never your real `data/sources.db` — and
 `review`/`config`/`export-approved` tests always write into a temporary
 directory, never your real `reviews/`/`config/`. `find` and `validate-config`
 need no network or filesystem mocking beyond that, since neither leaves your
@@ -510,12 +603,13 @@ source_curator/
   inspector.py            URL validation, page fetching, title extraction
   feeds.py                feed link discovery, fetching, parsing (feedparser)
   library.py              SQLite-backed source library (stdlib sqlite3, no ORM);
-                           status/notes/tags, local find(), and schema migration
+                           status/notes/tags, health fields, local find(), migration
   discovery.py            web search (ddgs) + candidate dedup/grouping
   scoring.py              relevance/freshness/curation-score math (pure, no I/O)
   evaluation.py           orchestrates discovery + inspection + scoring for `evaluate`
   review.py               Markdown review generation (metadata vs. curator notes)
   config_export.py        YAML entry building, file append/export, validate-config
+  health.py               health classification + check_source (pure except inspect_fn)
   cli.py                  argparse wiring and output formatting
 tests/
   test_inspector.py
@@ -526,6 +620,7 @@ tests/
   test_evaluation.py
   test_review.py
   test_config_export.py
+  test_health.py
   test_cli.py
 data/
   sources.db              created on first library-backed command's run; gitignored
@@ -620,3 +715,21 @@ Phase 7:
   duplicate IDs, syntactically valid URLs, `approved: true`) — it does not
   check that the URL is actually reachable, or that the referenced source
   still exists in your SQLite library.
+
+Phase 8:
+- "Health" is a point-in-time technical snapshot from the moment you last ran
+  `check`/`check-all` — nothing re-checks it automatically (no scheduling, by
+  design), so it goes stale itself the moment a once-healthy site goes down.
+- STALE and freshness only ever look at the **feed**'s item dates, exactly
+  like Phase 5 — a feedless page is always Unknown freshness (and therefore
+  HEALTHY, never STALE) no matter how outdated its actual content is.
+- `check`/`check-all` re-fetch the source's stored **final_url**, not the
+  original `requested_url` — if a site's redirect target has changed since it
+  was added, the check follows the new redirect rather than re-discovering it.
+- `check-all` checks every saved source regardless of its approval status —
+  there's no `--status`/`--health` pre-filter on `check-all` itself (use
+  `list --status ... ` to see candidates first, then `check` them one by one,
+  if you want to limit which ones get re-checked).
+- BROKEN vs. STALE is intentionally coarse: a feed that fetches fine but
+  whose newest item is 91 days old is STALE; a feed that fails to fetch even
+  once is BROKEN regardless of how fresh its last known content was.

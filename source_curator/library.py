@@ -19,10 +19,11 @@ STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
 
-# New databases get notes/tags straight away via this CREATE TABLE. Databases
-# created by an older version of this tool (Phase 3, before these columns
-# existed) are brought up to date by the migration in connect() below --
-# ALTER TABLE ADD COLUMN never touches existing rows' other data.
+# New databases get every column straight away via this CREATE TABLE.
+# Databases created by an older version of this tool (missing notes/tags from
+# before Phase 6, or the last_* health columns from before Phase 8) are
+# brought up to date by the migration in connect() below -- ALTER TABLE ADD
+# COLUMN never touches existing rows' other data.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,7 +37,14 @@ CREATE TABLE IF NOT EXISTS sources (
     status TEXT NOT NULL DEFAULT 'pending',
     added_at TEXT NOT NULL,
     notes TEXT,
-    tags TEXT
+    tags TEXT,
+    last_checked_at TEXT,
+    last_http_status INTEGER,
+    last_reachable INTEGER,
+    last_feed_reachable INTEGER,
+    last_freshness TEXT,
+    last_health_status TEXT,
+    last_error TEXT
 );
 """
 
@@ -45,6 +53,13 @@ CREATE TABLE IF NOT EXISTS sources (
 _MIGRATIONS = {
     "notes": "ALTER TABLE sources ADD COLUMN notes TEXT",
     "tags": "ALTER TABLE sources ADD COLUMN tags TEXT",
+    "last_checked_at": "ALTER TABLE sources ADD COLUMN last_checked_at TEXT",
+    "last_http_status": "ALTER TABLE sources ADD COLUMN last_http_status INTEGER",
+    "last_reachable": "ALTER TABLE sources ADD COLUMN last_reachable INTEGER",
+    "last_feed_reachable": "ALTER TABLE sources ADD COLUMN last_feed_reachable INTEGER",
+    "last_freshness": "ALTER TABLE sources ADD COLUMN last_freshness TEXT",
+    "last_health_status": "ALTER TABLE sources ADD COLUMN last_health_status TEXT",
+    "last_error": "ALTER TABLE sources ADD COLUMN last_error TEXT",
 }
 
 
@@ -163,12 +178,19 @@ def add_source(
     return saved, same_domain
 
 
-def list_sources(conn: sqlite3.Connection, status: str | None = None) -> list[sqlite3.Row]:
+def list_sources(
+    conn: sqlite3.Connection, status: str | None = None, health: str | None = None
+) -> list[sqlite3.Row]:
+    clauses = []
+    params: list[str] = []
     if status:
-        return conn.execute(
-            "SELECT * FROM sources WHERE status = ? ORDER BY id", (status,)
-        ).fetchall()
-    return conn.execute("SELECT * FROM sources ORDER BY id").fetchall()
+        clauses.append("status = ?")
+        params.append(status)
+    if health:
+        clauses.append("last_health_status = ?")
+        params.append(health)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    return conn.execute(f"SELECT * FROM sources{where} ORDER BY id", params).fetchall()
 
 
 def get_source(conn: sqlite3.Connection, source_id: int) -> sqlite3.Row | None:
@@ -264,3 +286,37 @@ def find_sources(
 
     scored.sort(key=lambda pair: (-pair[1], pair[0]["id"]))
     return scored
+
+
+def record_health_check(
+    conn: sqlite3.Connection,
+    source_id: int,
+    *,
+    checked_at: str,
+    http_status: int | None,
+    reachable: bool,
+    feed_reachable: bool | None,
+    freshness: str,
+    health_status: str,
+    error: str | None,
+) -> sqlite3.Row | None:
+    """Persist the result of a `check`/`check-all` health check. Returns the
+    updated row, or None if `source_id` doesn't exist (nothing is changed)."""
+    if get_source(conn, source_id) is None:
+        return None
+    conn.execute(
+        """
+        UPDATE sources SET
+            last_checked_at = ?,
+            last_http_status = ?,
+            last_reachable = ?,
+            last_feed_reachable = ?,
+            last_freshness = ?,
+            last_health_status = ?,
+            last_error = ?
+        WHERE id = ?
+        """,
+        (checked_at, http_status, reachable, feed_reachable, freshness, health_status, error, source_id),
+    )
+    conn.commit()
+    return get_source(conn, source_id)
