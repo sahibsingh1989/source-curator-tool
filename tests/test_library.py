@@ -119,9 +119,58 @@ class ConnectTests(unittest.TestCase):
     def test_reopening_existing_db_does_not_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "sources.db"
-            connect(db_path).close()
-            conn = connect(db_path)
-            conn.close()
+
+            first = connect(db_path)
+            try:
+                saved, _ = add_source(
+                    first,
+                    requested_url="https://example.com/",
+                    final_url="https://example.com/",
+                    domain="example.com",
+                    title="Example",
+                    content_type="text/html",
+                    feed_url=None,
+                )
+            finally:
+                first.close()
+
+            second = connect(db_path)
+            try:
+                # Reopening must still see the full current schema and the
+                # data saved in the first connection -- not just "didn't
+                # raise an exception".
+                columns = {row["name"] for row in second.execute("PRAGMA table_info(sources)")}
+                self.assertEqual(
+                    columns,
+                    {
+                        "id",
+                        "requested_url",
+                        "final_url",
+                        "normalized_url",
+                        "domain",
+                        "title",
+                        "content_type",
+                        "feed_url",
+                        "status",
+                        "added_at",
+                        "notes",
+                        "tags",
+                        "last_checked_at",
+                        "last_http_status",
+                        "last_reachable",
+                        "last_feed_reachable",
+                        "last_freshness",
+                        "last_health_status",
+                        "last_error",
+                    },
+                )
+
+                row = get_source(second, saved["id"])
+                self.assertIsNotNone(row)
+                self.assertEqual(row["title"], "Example")
+                self.assertEqual(row["domain"], "example.com")
+            finally:
+                second.close()
 
 
 class AddSourceTests(TempDbTestCase):
@@ -185,6 +234,62 @@ class DuplicateBlockingTests(TempDbTestCase):
         saved, _ = self.add("https://example.com/page-two")
         self.assertIsNotNone(saved)
         self.assertEqual(len(list_sources(self.conn)), 2)
+
+    def test_concurrent_insert_race_is_converted_to_duplicate_error(self):
+        """Simulate a race: another add_source() call wins and inserts the
+        row between our pre-check and our own INSERT. The pre-check is faked
+        to report "nothing exists yet" once, so this call proceeds straight
+        to INSERT and collides with the UNIQUE constraint on normalized_url
+        -- that sqlite3.IntegrityError must come back as a clean
+        DuplicateSourceError, not a raw traceback."""
+        from unittest.mock import patch
+
+        import source_curator.library as library_module
+
+        final_url = "https://race.example.com/page"
+        normalized = normalize_url(final_url)
+
+        # The "other" add_source call that won the race, inserted directly
+        # so our own pre-check (mocked below) can plausibly have missed it.
+        self.conn.execute(
+            """
+            INSERT INTO sources
+                (requested_url, final_url, normalized_url, domain, title,
+                 content_type, feed_url, status, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                final_url,
+                final_url,
+                normalized,
+                "race.example.com",
+                "Winner of the race",
+                "text/html",
+                None,
+                "pending",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        self.conn.commit()
+
+        real_find_by_normalized_url = library_module.find_by_normalized_url
+        calls = {"count": 0}
+
+        def fake_find_by_normalized_url(conn, normalized_url):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return None  # pre-check: pretend nothing exists yet
+            return real_find_by_normalized_url(conn, normalized_url)
+
+        with patch.object(
+            library_module, "find_by_normalized_url", side_effect=fake_find_by_normalized_url
+        ):
+            with self.assertRaises(DuplicateSourceError) as ctx:
+                self.add(final_url)
+
+        self.assertEqual(ctx.exception.existing["title"], "Winner of the race")
+        # The race must not have produced a second row.
+        self.assertEqual(len(list_sources(self.conn)), 1)
 
 
 class SameDomainWarningTests(TempDbTestCase):
@@ -612,13 +717,46 @@ class MigrationTests(unittest.TestCase):
                 conn.close()
 
     def test_migration_is_idempotent(self):
+        from source_curator.library import _migrate_schema
+
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "sources.db"
-            connect(db_path).close()
-            # Reopening (and thus re-running the migration check) on an
-            # already-current database must not fail or duplicate columns.
             conn = connect(db_path)
-            conn.close()
+            try:
+                saved, _ = add_source(
+                    conn,
+                    requested_url="https://example.com/",
+                    final_url="https://example.com/",
+                    domain="example.com",
+                    title="Example",
+                    content_type="text/html",
+                    feed_url=None,
+                )
+                set_tags(conn, saved["id"], ["tag"])
+
+                columns_before = sorted(
+                    row["name"] for row in conn.execute("PRAGMA table_info(sources)")
+                )
+
+                # Re-running the migration on an already-current database
+                # (as every connect() call does) must not fail, and must not
+                # duplicate or otherwise change any column -- not just "ran
+                # without raising".
+                _migrate_schema(conn)
+                _migrate_schema(conn)
+
+                columns_after = sorted(
+                    row["name"] for row in conn.execute("PRAGMA table_info(sources)")
+                )
+                self.assertEqual(columns_before, columns_after)
+                self.assertEqual(len(columns_after), len(set(columns_after)))  # no duplicates
+
+                # Existing data must still be intact and queryable.
+                row = get_source(conn, saved["id"])
+                self.assertEqual(row["title"], "Example")
+                self.assertEqual(parse_tags(row["tags"]), ["tag"])
+            finally:
+                conn.close()
 
 
 class RecordHealthCheckTests(TempDbTestCase):

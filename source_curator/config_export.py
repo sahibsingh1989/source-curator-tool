@@ -21,14 +21,6 @@ DEFAULT_EXPORT_PATH = Path("config") / "approved_sources.yaml"
 REQUIRED_FIELDS = ("id", "name", "url", "domain", "type", "topics", "approved")
 
 
-class NotApprovedError(Exception):
-    """Raised when generating a config entry for a source that isn't approved."""
-
-    def __init__(self, row):
-        self.row = row
-        super().__init__(f"source #{row['id']} is not approved (status: {row['status']})")
-
-
 class DuplicateConfigIdError(Exception):
     """Raised by append_entry when the target file already has this source ID."""
 

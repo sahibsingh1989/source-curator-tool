@@ -154,11 +154,27 @@ class AppendEntryTests(ConfigTestCase):
         self.assertEqual(len(load_entries(output)), 1)
 
     def test_output_is_always_valid_yaml(self):
-        row = self.add()
+        first = self.add()
+        second = self.add(final_url="https://other.example.com/", domain="other.example.com")
         output = Path(self._tmpdir.name) / "config.yaml"
-        append_entry(row, output)
+
+        append_entry(first, output)
+        append_entry(second, output)
+
         text = output.read_text(encoding="utf-8")
-        yaml.safe_load(text)  # must not raise
+        data = yaml.safe_load(text)
+
+        # Not just "parses without raising" -- the re-serialized file must
+        # actually be a two-entry list matching what was appended, with the
+        # expected keys and values on each entry.
+        self.assertIsInstance(data, list)
+        self.assertEqual(len(data), 2)
+        self.assertEqual({entry["id"] for entry in data}, {first["id"], second["id"]})
+        for entry in data:
+            self.assertEqual(
+                set(entry.keys()), {"id", "name", "url", "domain", "type", "topics", "approved"}
+            )
+            self.assertIs(entry["approved"], True)
 
 
 class LoadEntriesTests(unittest.TestCase):

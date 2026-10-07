@@ -157,6 +157,37 @@ class MainTests(unittest.TestCase):
                 main([])
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_sqlite_error_reported_cleanly_with_nonzero_exit(self):
+        import sqlite3
+
+        with patch(
+            "source_curator.cli.library.connect",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = main(["list", "--db", "unused.db"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("Error: database is locked", err.getvalue())
+
+    def test_os_error_reported_cleanly_with_nonzero_exit(self):
+        with patch("source_curator.cli.library.connect", side_effect=OSError("disk full")):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = main(["list", "--db", "unused.db"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("Error: disk full", err.getvalue())
+
+    def test_unexpected_programming_bug_is_not_swallowed(self):
+        # The top-level handler must stay narrow: only sqlite3.Error/OSError
+        # are caught, so an actual bug still surfaces instead of being
+        # silently turned into a generic "Error: ..." exit.
+        with patch("source_curator.cli.library.connect", side_effect=TypeError("boom")):
+            with self.assertRaises(TypeError):
+                main(["list", "--db", "unused.db"])
+
 
 class LibraryCommandTests(unittest.TestCase):
     """Tests for add/list/show. Each test gets its own temp DB file."""
@@ -1059,6 +1090,84 @@ class CheckCommandTests(unittest.TestCase):
         self.assertIn("HEALTHY", out)
         self.assertIn("BROKEN", out)
         self.assertIn("Checked 2 source(s): 1 healthy, 0 stale, 1 broken.", out)
+
+    def test_check_all_unexpected_exception_does_not_stop_the_rest(self):
+        """health.check_source could fail with something other than the
+        InspectionError it already handles internally (a bug, an odd edge
+        case) -- check-all must isolate that to one source, not abort."""
+        self.seed_source(SAMPLE)
+        other = replace(
+            SAMPLE,
+            requested_url="https://other.example.com",
+            final_url="https://other.example.com/",
+            domain="other.example.com",
+            title="Other",
+        )
+        self.seed_source(other)
+
+        def fake_check_source(row, timeout):
+            if row["domain"] == "other.example.com":
+                raise RuntimeError("boom")
+            return self.make_result()
+
+        with patch("source_curator.cli.health.check_source", side_effect=fake_check_source):
+            code, out, _ = self.run_main(["check-all"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("#1", out)
+        self.assertIn("#2", out)
+        self.assertIn("HEALTHY", out)
+        self.assertIn("BROKEN", out)
+        self.assertIn("Checked 2 source(s): 1 healthy, 0 stale, 1 broken.", out)
+
+        code, out, _ = self.run_main(["show", "2"])
+        self.assertIn("boom", out)
+
+    def test_check_all_database_write_failure_is_isolated(self):
+        """If persisting one source's result fails (e.g. a locked database),
+        check-all must still report on it and keep checking the rest,
+        instead of aborting the whole batch. The check itself still
+        succeeded here, so the observed result (healthy) is what's reported
+        for that source -- only the save failed, which is a different
+        problem from the source being unreachable."""
+        import sqlite3
+
+        from source_curator.library import record_health_check as real_record_health_check
+
+        self.seed_source(SAMPLE)
+        other = replace(
+            SAMPLE,
+            requested_url="https://other.example.com",
+            final_url="https://other.example.com/",
+            domain="other.example.com",
+            title="Other",
+        )
+        self.seed_source(other)
+
+        def fake_record_health_check(conn, source_id, **kwargs):
+            if source_id == 2:
+                raise sqlite3.OperationalError("database is locked")
+            return real_record_health_check(conn, source_id, **kwargs)
+
+        with patch("source_curator.cli.health.check_source", return_value=self.make_result()):
+            with patch(
+                "source_curator.cli.library.record_health_check",
+                side_effect=fake_record_health_check,
+            ):
+                code, out, _ = self.run_main(["check-all"])
+
+        # The whole batch must complete (not crash) even though source #2's
+        # health check could not be persisted.
+        self.assertEqual(code, 0)
+        self.assertIn("#1", out)
+        self.assertIn("#2", out)
+        self.assertIn("Checked 2 source(s): 2 healthy, 0 stale, 0 broken.", out)
+
+        # The failed write must not have reached the database: #2's stored
+        # health fields are still whatever they were before this run (never
+        # checked), proving nothing was silently corrupted.
+        code, show_out, _ = self.run_main(["show", "2"])
+        self.assertIn("(never checked)", show_out)
 
     def test_check_all_empty_library(self):
         code, out, _ = self.run_main(["check-all"])

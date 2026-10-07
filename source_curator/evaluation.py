@@ -64,6 +64,11 @@ def evaluate_candidates(
             result = inspect_fn(candidate.url, timeout=timeout)
         except InspectionError as exc:
             unreachable_reason = str(exc)
+        except Exception as exc:
+            # Isolate one candidate's unexpected failure (anything inspect_fn
+            # doesn't document raising) from the rest of the batch -- a bad
+            # candidate must never abort evaluation of the others.
+            unreachable_reason = f"Unexpected error while inspecting candidate: {exc}"
         else:
             reachable = True
             status_code = result.status_code

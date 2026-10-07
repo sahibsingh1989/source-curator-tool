@@ -13,11 +13,15 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 DEFAULT_DB_PATH = Path("data") / "sources.db"
-DEFAULT_STATUS = "pending"
 
 STATUS_PENDING = "pending"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
+
+# The one canonical constant for "a newly-added source's default status" --
+# an alias, not a second independent literal, so it can never drift out of
+# sync with STATUS_PENDING.
+DEFAULT_STATUS = STATUS_PENDING
 
 # New databases get every column straight away via this CREATE TABLE.
 # Databases created by an older version of this tool (missing notes/tags from
@@ -141,7 +145,12 @@ def add_source(
 ) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
     """Save a source keyed on normalize_url(final_url).
 
-    Raises DuplicateSourceError if that normalized URL is already saved.
+    Raises DuplicateSourceError if that normalized URL is already saved --
+    either because the pre-check below found it, or because a concurrent
+    add_source() call for the same URL won a race and inserted it first (the
+    UNIQUE constraint on normalized_url catches that case too; see the
+    except clause below, which converts it into the same clean error rather
+    than letting the raw sqlite3.IntegrityError escape).
     Returns (saved_row, other_rows_already_saved_on_the_same_domain) so the
     caller can warn about (but still allow) a second source on one domain.
     """
@@ -154,25 +163,34 @@ def add_source(
     same_domain = find_by_domain(conn, domain)
 
     added_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    cursor = conn.execute(
-        """
-        INSERT INTO sources
-            (requested_url, final_url, normalized_url, domain, title,
-             content_type, feed_url, status, added_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            requested_url,
-            final_url,
-            normalized,
-            domain,
-            title,
-            content_type,
-            feed_url,
-            status,
-            added_at,
-        ),
-    )
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO sources
+                (requested_url, final_url, normalized_url, domain, title,
+                 content_type, feed_url, status, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                requested_url,
+                final_url,
+                normalized,
+                domain,
+                title,
+                content_type,
+                feed_url,
+                status,
+                added_at,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        # Lost a race: something else inserted this normalized_url between
+        # our pre-check above and this INSERT. Report it the same clean way
+        # as the pre-check rather than letting the raw error escape.
+        existing = find_by_normalized_url(conn, normalized)
+        if existing is not None:
+            raise DuplicateSourceError(existing) from None
+        raise  # a different integrity error -- don't hide it as a false duplicate
     conn.commit()
     saved = get_source(conn, cursor.lastrowid)
     return saved, same_domain

@@ -87,6 +87,26 @@ class EvaluateCandidatesTests(unittest.TestCase):
         domains = {item.domain for item in results}
         self.assertEqual(domains, {"broken.example.com", "fine.example.com"})
 
+    def test_unexpected_exception_from_inspect_fn_does_not_abort_the_batch(self):
+        """Not every failure inspect_fn could ever raise is an InspectionError
+        -- a bug or an odd edge case must still be isolated to one candidate."""
+        buggy = make_candidate(url="https://buggy.example.com/", domain="buggy.example.com")
+        fine = make_candidate(url="https://fine.example.com/", domain="fine.example.com")
+
+        def fake_inspect(url, timeout):
+            if "buggy" in url:
+                raise ValueError("something went unexpectedly wrong")
+            return make_inspection(url=url)
+
+        results = evaluate_candidates([buggy, fine], "topic", inspect_fn=fake_inspect)
+
+        self.assertEqual(len(results), 2)
+        by_domain = {item.domain: item for item in results}
+        buggy_result = by_domain["buggy.example.com"]
+        self.assertFalse(buggy_result.reachable)
+        self.assertIn("something went unexpectedly wrong", buggy_result.explanation)
+        self.assertTrue(by_domain["fine.example.com"].reachable)
+
     def test_candidate_with_feed_gets_marked_found(self):
         candidate = make_candidate()
 

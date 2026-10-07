@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
+from datetime import datetime, timezone
 
 from . import __version__, config_export, discovery, evaluation, health, library, review
 from .feeds import FeedInfo
 from .inspector import DEFAULT_TIMEOUT, Inspection, InspectionError, inspect
+from .scoring import FRESH_UNKNOWN
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -656,19 +659,67 @@ def format_health_row(row) -> str:
     )
 
 
+def _safe_check_source(row, timeout: float) -> health.HealthCheckResult:
+    """health.check_source(), but any unexpected failure (not just the
+    InspectionError it already handles) becomes a BROKEN result instead of
+    propagating. Used so check-all can never be aborted by one bad source."""
+    try:
+        return health.check_source(row, timeout=timeout)
+    except Exception as exc:
+        return health.HealthCheckResult(
+            checked_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            reachable=False,
+            http_status=None,
+            final_url=None,
+            feed_found=False,
+            feed_reachable=None,
+            feed_url=None,
+            latest_feed_date=None,
+            freshness=FRESH_UNKNOWN,
+            health_status=health.HEALTH_BROKEN,
+            error=f"Unexpected error while checking source: {exc}",
+        )
+
+
+def _safe_record_health_check(conn, row, result: health.HealthCheckResult):
+    """library.record_health_check(), but a database/filesystem failure while
+    persisting this one result returns a best-effort in-memory row (with the
+    failure preserved) instead of propagating -- so one source's save
+    failure can't stop check-all from checking the rest."""
+    try:
+        return library.record_health_check(
+            conn,
+            row["id"],
+            checked_at=result.checked_at,
+            http_status=result.http_status,
+            reachable=result.reachable,
+            feed_reachable=result.feed_reachable,
+            freshness=result.freshness,
+            health_status=result.health_status,
+            error=result.error,
+        )
+    except (sqlite3.Error, OSError) as exc:
+        fallback = dict(row)
+        fallback.update(
+            last_checked_at=result.checked_at,
+            last_http_status=result.http_status,
+            last_reachable=result.reachable,
+            last_feed_reachable=result.feed_reachable,
+            last_freshness=result.freshness,
+            last_health_status=result.health_status,
+            last_error=(f"{result.error}; " if result.error else "")
+            + f"Could not save health check: {exc}",
+        )
+        return fallback
+
+
 def _run_health_check(conn, row, timeout: float):
-    result = health.check_source(row, timeout=timeout)
-    updated = library.record_health_check(
-        conn,
-        row["id"],
-        checked_at=result.checked_at,
-        http_status=result.http_status,
-        reachable=result.reachable,
-        feed_reachable=result.feed_reachable,
-        freshness=result.freshness,
-        health_status=result.health_status,
-        error=result.error,
-    )
+    """Check and persist one source's health, in a way that can never raise:
+    both halves above are deliberately broad because this helper's entire
+    purpose -- especially for check-all -- is to isolate one source's
+    network, parsing, or database failure from the rest of the batch."""
+    result = _safe_check_source(row, timeout)
+    updated = _safe_record_health_check(conn, row, result)
     return updated, result
 
 
@@ -790,4 +841,12 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return COMMANDS[args.command](args)
+    try:
+        return COMMANDS[args.command](args)
+    except (sqlite3.Error, OSError) as exc:
+        # Expected, environmental failures (locked/corrupt database file,
+        # permission denied, disk full, etc.) -- report cleanly instead of a
+        # traceback. Deliberately narrow: this does not catch bare
+        # Exception, so an actual programming bug still surfaces as one.
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
