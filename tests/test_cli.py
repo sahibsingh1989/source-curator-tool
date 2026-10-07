@@ -10,6 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 from source_curator.cli import format_inspection, main
 from source_curator.feeds import FeedInfo, FeedItem
 from source_curator.inspector import Inspection, InspectionError
@@ -693,6 +695,201 @@ class CurationCommandTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 main(["list", "--status", "bogus", "--db", str(self.db_path)])
         self.assertEqual(ctx.exception.code, 2)
+
+
+class ReviewConfigCommandTests(unittest.TestCase):
+    """Tests for review/config/export-approved/validate-config. Each test gets
+    its own temp DB file plus temp reviews/config directories."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmpdir.name) / "sources.db"
+        self.reviews_dir = Path(self._tmpdir.name) / "reviews"
+        self.config_path = Path(self._tmpdir.name) / "config" / "generated_sources.yaml"
+        self.export_path = Path(self._tmpdir.name) / "config" / "approved_sources.yaml"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def seed_one_source(self):
+        with patch("source_curator.cli.inspect", return_value=SAMPLE):
+            self.run_main(["add", "https://example.com", "--db", str(self.db_path)])
+
+    # -- review --------------------------------------------------------
+
+    def test_review_generates_markdown_file(self):
+        self.seed_one_source()
+
+        code, out, _ = self.run_main(
+            ["review", "1", "--db", str(self.db_path), "--dir", str(self.reviews_dir)]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Wrote review for #1", out)
+        files = list(self.reviews_dir.glob("*.md"))
+        self.assertEqual(len(files), 1)
+        self.assertIn("Example Domain", files[0].read_text(encoding="utf-8"))
+
+    def test_review_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(
+            ["review", "999", "--db", str(self.db_path), "--dir", str(self.reviews_dir)]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_review_overwrite_protection(self):
+        self.seed_one_source()
+        self.run_main(["review", "1", "--db", str(self.db_path), "--dir", str(self.reviews_dir)])
+
+        code, _, err = self.run_main(
+            ["review", "1", "--db", str(self.db_path), "--dir", str(self.reviews_dir)]
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", err)
+        self.assertIn("--overwrite", err)
+
+    def test_review_overwrite_flag_replaces_file(self):
+        self.seed_one_source()
+        self.run_main(["review", "1", "--db", str(self.db_path), "--dir", str(self.reviews_dir)])
+        self.run_main(["note", "1", "New note", "--db", str(self.db_path)])
+
+        code, _, _ = self.run_main(
+            ["review", "1", "--overwrite", "--db", str(self.db_path), "--dir", str(self.reviews_dir)]
+        )
+
+        self.assertEqual(code, 0)
+        files = list(self.reviews_dir.glob("*.md"))
+        self.assertIn("New note", files[0].read_text(encoding="utf-8"))
+
+    # -- config ----------------------------------------------------------
+
+    def test_config_requires_approved_status(self):
+        self.seed_one_source()  # pending by default
+
+        code, _, err = self.run_main(["config", "1", "--db", str(self.db_path)])
+
+        self.assertEqual(code, 1)
+        self.assertIn("not approved", err)
+
+    def test_config_prints_yaml_to_stdout_when_approved(self):
+        self.seed_one_source()
+        self.run_main(["approve", "1", "--db", str(self.db_path)])
+
+        code, out, _ = self.run_main(["config", "1", "--db", str(self.db_path)])
+
+        self.assertEqual(code, 0)
+        data = yaml.safe_load(out)
+        self.assertEqual(data[0]["id"], 1)
+        self.assertEqual(data[0]["approved"], True)
+        self.assertEqual(data[0]["domain"], "example.com")
+
+    def test_config_missing_id_reports_clean_error(self):
+        code, _, err = self.run_main(["config", "999", "--db", str(self.db_path)])
+        self.assertEqual(code, 1)
+        self.assertIn("no saved source with ID 999", err)
+
+    def test_config_output_appends_to_file(self):
+        self.seed_one_source()
+        self.run_main(["approve", "1", "--db", str(self.db_path)])
+
+        code, out, _ = self.run_main(
+            ["config", "1", "--db", str(self.db_path), "--output", str(self.config_path)]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Appended", out)
+        data = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["id"], 1)
+
+    def test_config_output_rejects_duplicate_id(self):
+        self.seed_one_source()
+        self.run_main(["approve", "1", "--db", str(self.db_path)])
+        self.run_main(["config", "1", "--db", str(self.db_path), "--output", str(self.config_path)])
+
+        code, _, err = self.run_main(
+            ["config", "1", "--db", str(self.db_path), "--output", str(self.config_path)]
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("already present", err)
+
+    # -- export-approved ---------------------------------------------------
+
+    def test_export_approved_only_includes_approved(self):
+        self.seed_one_source()
+        with patch(
+            "source_curator.cli.inspect",
+            return_value=replace(
+                SAMPLE,
+                requested_url="https://other.example.com",
+                final_url="https://other.example.com/",
+                domain="other.example.com",
+                title="Other",
+            ),
+        ):
+            self.run_main(["add", "https://other.example.com", "--db", str(self.db_path)])
+        self.run_main(["approve", "1", "--db", str(self.db_path)])
+        self.run_main(["reject", "2", "--db", str(self.db_path)])
+
+        code, out, _ = self.run_main(
+            ["export-approved", "--db", str(self.db_path), "--output", str(self.export_path)]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Exported 1 approved", out)
+        data = yaml.safe_load(self.export_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["id"], 1)
+
+    def test_export_approved_regenerates_file(self):
+        self.seed_one_source()
+        self.run_main(["approve", "1", "--db", str(self.db_path)])
+        self.run_main(["export-approved", "--db", str(self.db_path), "--output", str(self.export_path)])
+
+        self.run_main(["reject", "1", "--db", str(self.db_path)])
+        self.run_main(["export-approved", "--db", str(self.db_path), "--output", str(self.export_path)])
+
+        data = yaml.safe_load(self.export_path.read_text(encoding="utf-8"))
+        self.assertEqual(data, [])
+
+    # -- validate-config ---------------------------------------------------
+
+    def test_validate_config_on_generated_export_is_valid(self):
+        self.seed_one_source()
+        self.run_main(["approve", "1", "--db", str(self.db_path)])
+        self.run_main(["export-approved", "--db", str(self.db_path), "--output", str(self.export_path)])
+
+        code, out, _ = self.run_main(["validate-config", str(self.export_path)])
+
+        self.assertEqual(code, 0)
+        self.assertIn("OK", out)
+
+    def test_validate_config_reports_issues_and_exits_nonzero(self):
+        bad_path = Path(self._tmpdir.name) / "bad.yaml"
+        bad_path.write_text("- id: 1\n  name: A\n  approved: true\n", encoding="utf-8")
+
+        code, out, _ = self.run_main(["validate-config", str(bad_path)])
+
+        self.assertEqual(code, 1)
+        self.assertIn("Invalid", out)
+        self.assertIn("url", out)
+
+    def test_validate_config_malformed_yaml_handled_cleanly(self):
+        bad_path = Path(self._tmpdir.name) / "bad.yaml"
+        bad_path.write_text("id: [1, 2\nname: broken", encoding="utf-8")
+
+        code, out, _ = self.run_main(["validate-config", str(bad_path)])
+
+        self.assertEqual(code, 1)
+        self.assertIn("Malformed YAML", out)
 
 
 if __name__ == "__main__":

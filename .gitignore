@@ -23,3 +23,8 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+
+# Generated per-user curation output (Phase 7): reviews and config entries
+# built from someone's own saved sources, not part of the tool's source code.
+reviews/
+config/

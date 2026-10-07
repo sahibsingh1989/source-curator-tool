@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, discovery, evaluation, library
+from . import __version__, config_export, discovery, evaluation, library, review
 from .feeds import FeedInfo
 from .inspector import DEFAULT_TIMEOUT, Inspection, InspectionError, inspect
 
@@ -153,6 +153,57 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(library.DEFAULT_DB_PATH),
         help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
     )
+
+    review_parser = subparsers.add_parser(
+        "review", help="Generate a Markdown review file for a saved source."
+    )
+    review_parser.add_argument("id", type=int, help="Saved source ID, from `list`.")
+    review_parser.add_argument(
+        "--overwrite", action="store_true", help="Replace the review file if it already exists."
+    )
+    review_parser.add_argument(
+        "--dir",
+        default=str(review.DEFAULT_REVIEWS_DIR),
+        help=f"Directory to write the review into (default: {review.DEFAULT_REVIEWS_DIR}).",
+    )
+    review_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    config_parser = subparsers.add_parser(
+        "config", help="Generate a YAML config entry for an approved saved source."
+    )
+    config_parser.add_argument("id", type=int, help="Saved source ID, from `list`.")
+    config_parser.add_argument(
+        "--output",
+        help="Append the entry to this YAML file instead of printing it to stdout.",
+    )
+    config_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    export_parser = subparsers.add_parser(
+        "export-approved", help="Regenerate a YAML file with every currently-approved source."
+    )
+    export_parser.add_argument(
+        "--output",
+        default=str(config_export.DEFAULT_EXPORT_PATH),
+        help=f"Output YAML file (default: {config_export.DEFAULT_EXPORT_PATH}). Overwritten each run.",
+    )
+    export_parser.add_argument(
+        "--db",
+        default=str(library.DEFAULT_DB_PATH),
+        help=f"Path to the SQLite database (default: {library.DEFAULT_DB_PATH}).",
+    )
+
+    validate_parser = subparsers.add_parser(
+        "validate-config", help="Validate a generated YAML config file."
+    )
+    validate_parser.add_argument("path", help="Path to a YAML config file to validate.")
 
     return parser
 
@@ -432,6 +483,86 @@ def cmd_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        row = library.get_source(conn, args.id)
+    finally:
+        conn.close()
+
+    if row is None:
+        print(f"Error: no saved source with ID {args.id}", file=sys.stderr)
+        return 1
+
+    try:
+        path = review.write_review(row, reviews_dir=args.dir, overwrite=args.overwrite)
+    except review.ReviewExistsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Wrote review for #{row['id']} to {path}")
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        row = library.get_source(conn, args.id)
+    finally:
+        conn.close()
+
+    if row is None:
+        print(f"Error: no saved source with ID {args.id}", file=sys.stderr)
+        return 1
+
+    if row["status"] != library.STATUS_APPROVED:
+        print(
+            f"Error: source #{row['id']} is not approved (status: {row['status']}) "
+            "-- only approved sources can be exported to config.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.output:
+        try:
+            path = config_export.append_entry(row, args.output)
+        except config_export.DuplicateConfigIdError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Appended source #{row['id']} to {path}")
+        return 0
+
+    print(config_export.entry_to_yaml(row), end="")
+    return 0
+
+
+def cmd_export_approved(args: argparse.Namespace) -> int:
+    conn = library.connect(args.db)
+    try:
+        path, count = config_export.export_approved(conn, args.output)
+    finally:
+        conn.close()
+
+    print(f"Exported {count} approved source(s) to {path}")
+    return 0
+
+
+def cmd_validate_config(args: argparse.Namespace) -> int:
+    issues = config_export.validate_config(args.path)
+
+    if not issues:
+        print(f"OK: {args.path} is valid.")
+        return 0
+
+    print(f"Invalid: {args.path}")
+    for issue in issues:
+        print(f"  - {issue.message}")
+    return 1
+
+
 def cmd_discover(args: argparse.Namespace) -> int:
     try:
         raw_results = discovery.search(args.query, limit=args.limit)
@@ -497,6 +628,10 @@ COMMANDS = {
     "note": cmd_note,
     "tag": cmd_tag,
     "find": cmd_find,
+    "review": cmd_review,
+    "config": cmd_config,
+    "export-approved": cmd_export_approved,
+    "validate-config": cmd_validate_config,
 }
 
 
