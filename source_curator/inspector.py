@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from .feeds import FeedInfo, find_feed
+from .feeds import FeedInfo, find_feed, verified_feed
 
 USER_AGENT = "source-curator-tool/0.1 (+https://example.invalid/source-curator-tool)"
 DEFAULT_TIMEOUT = 10.0
@@ -84,6 +84,18 @@ def _looks_like_html(content_type: str | None) -> bool:
     return content_type is None or "html" in content_type.lower()
 
 
+_FEED_PREFIXES = (b"<?xml", b"<rss", b"<feed", b"<rdf:rdf")
+
+
+def _may_be_feed(content_type: str | None, content: bytes) -> bool:
+    """True if the response could itself be an RSS/Atom document (still to be verified)."""
+    lowered = (content_type or "").lower()
+    if "html" not in lowered and any(word in lowered for word in ("xml", "rss", "atom")):
+        return True
+    head = content[:512].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    return head.startswith(_FEED_PREFIXES)
+
+
 def inspect(url: str, timeout: float = DEFAULT_TIMEOUT) -> Inspection:
     """Fetch `url` (following redirects) and summarize the response."""
     url = validate_url(url)
@@ -107,7 +119,14 @@ def inspect(url: str, timeout: float = DEFAULT_TIMEOUT) -> Inspection:
 
     title = None
     feed = FeedInfo(found=False)
-    if _looks_like_html(content_type):
+    direct = None
+    if _may_be_feed(content_type, response.content):
+        direct = verified_feed(response.content, final_url)
+    if direct is not None:
+        # The URL is itself a feed: report it directly instead of looking for links.
+        feed = direct
+        title = direct.title
+    elif _looks_like_html(content_type):
         title = extract_title(response.text)
         feed = find_feed(response.text, final_url, timeout=timeout)
 

@@ -16,11 +16,14 @@ from source_curator.inspector import (
 class FakeResponse:
     """Just enough of requests.Response for the inspector."""
 
-    def __init__(self, status_code=200, url="https://example.com/", headers=None, text=""):
+    def __init__(
+        self, status_code=200, url="https://example.com/", headers=None, text="", content=None
+    ):
         self.status_code = status_code
         self.url = url
         self.headers = headers if headers is not None else {"Content-Type": "text/html"}
         self.text = text
+        self.content = content if content is not None else text.encode("utf-8")
 
 
 class FakeFeedResponse:
@@ -47,6 +50,26 @@ RSS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
 <item><title>Second Post</title><link>https://blog.example.com/second</link>
 <pubDate>Tue, 30 Sep 2025 09:00:00 GMT</pubDate></item>
 </channel></rss>"""
+ATOM_XML = b"""<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Example Atom Feed</title>
+<entry><title>Atom Entry One</title><link href="https://blog.example.com/atom-one" />
+<updated>2025-10-01T12:00:00Z</updated></entry>
+</feed>"""
+
+SITEMAP_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>https://example.com/</loc></url></urlset>"""
+
+HTML_WITH_RSS_ANCHOR = """<html><head><title>RSS Feeds</title></head><body>
+<a href="/rss/news.xml">News Releases</a>
+</body></html>"""
+
+
+def xml_response(content, url, content_type="text/xml"):
+    return FakeResponse(
+        url=url, headers={"Content-Type": content_type}, text=content.decode(), content=content
+    )
 
 
 class ValidateUrlTests(unittest.TestCase):
@@ -283,6 +306,103 @@ class InspectFeedIntegrationTests(unittest.TestCase):
         result = inspect("https://example.com/data.json")
 
         self.assertFalse(result.feed.found)
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("source_curator.inspector.requests.get")
+    def test_detects_feed_from_plain_anchor_link(self, mock_get):
+        mock_get.side_effect = [
+            FakeResponse(url="https://example.com/rss/index.html", text=HTML_WITH_RSS_ANCHOR),
+            FakeFeedResponse(content=RSS_XML),
+        ]
+
+        result = inspect("https://example.com/rss/index.html")
+
+        self.assertEqual(result.title, "RSS Feeds")
+        self.assertTrue(result.feed.found)
+        self.assertEqual(result.feed.feed_url, "https://example.com/rss/news.xml")
+        self.assertEqual(result.feed.title, "Example Blog")
+        self.assertEqual(len(result.feed.items), 2)
+
+    @patch("source_curator.inspector.requests.get")
+    def test_anchor_to_non_feed_xml_reports_not_found(self, mock_get):
+        mock_get.side_effect = [
+            FakeResponse(url="https://example.com/", text='<a href="/sitemap.xml">Sitemap</a>'),
+            FakeFeedResponse(content=SITEMAP_XML),
+        ]
+
+        result = inspect("https://example.com/")
+
+        self.assertFalse(result.feed.found)
+        self.assertIsNone(result.feed.error)
+
+
+class InspectDirectFeedTests(unittest.TestCase):
+    """Inspecting a URL that is itself an RSS/Atom feed."""
+
+    @patch("source_curator.inspector.requests.get")
+    def test_direct_rss_url(self, mock_get):
+        mock_get.return_value = xml_response(RSS_XML, "https://blog.example.com/feed.xml")
+
+        result = inspect("https://blog.example.com/feed.xml")
+
+        self.assertTrue(result.feed.found)
+        self.assertEqual(result.feed.feed_url, "https://blog.example.com/feed.xml")
+        self.assertEqual(result.feed.title, "Example Blog")
+        self.assertEqual(result.title, "Example Blog")
+        self.assertEqual(len(result.feed.items), 2)
+        self.assertEqual(result.feed.items[0].published, "Wed, 01 Oct 2025 12:00:00 GMT")
+        self.assertIsNone(result.feed.error)
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("source_curator.inspector.requests.get")
+    def test_direct_atom_url(self, mock_get):
+        mock_get.return_value = xml_response(
+            ATOM_XML, "https://blog.example.com/atom", content_type="application/atom+xml"
+        )
+
+        result = inspect("https://blog.example.com/atom")
+
+        self.assertTrue(result.feed.found)
+        self.assertEqual(result.feed.feed_url, "https://blog.example.com/atom")
+        self.assertEqual(result.feed.title, "Example Atom Feed")
+        self.assertEqual(result.feed.items[0].published, "2025-10-01T12:00:00Z")
+
+    @patch("source_curator.inspector.requests.get")
+    def test_direct_feed_uses_final_url_after_redirect(self, mock_get):
+        mock_get.return_value = xml_response(RSS_XML, "https://blog.example.com/feed.xml")
+
+        result = inspect("http://blog.example.com/rss")
+
+        self.assertEqual(result.feed.feed_url, "https://blog.example.com/feed.xml")
+
+    @patch("source_curator.inspector.requests.get")
+    def test_feed_served_as_text_html_is_still_recognized(self, mock_get):
+        mock_get.return_value = xml_response(
+            RSS_XML, "https://example.com/feed", content_type="text/html; charset=utf-8"
+        )
+
+        result = inspect("https://example.com/feed")
+
+        self.assertTrue(result.feed.found)
+        self.assertEqual(result.feed.title, "Example Blog")
+
+    @patch("source_curator.inspector.requests.get")
+    def test_direct_malformed_feed_is_not_reported(self, mock_get):
+        mock_get.return_value = xml_response(b"<not><valid#$ feed", "https://example.com/f.xml")
+
+        result = inspect("https://example.com/f.xml")
+
+        self.assertFalse(result.feed.found)
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("source_curator.inspector.requests.get")
+    def test_direct_non_feed_xml_is_not_reported(self, mock_get):
+        mock_get.return_value = xml_response(SITEMAP_XML, "https://example.com/sitemap.xml")
+
+        result = inspect("https://example.com/sitemap.xml")
+
+        self.assertFalse(result.feed.found)
+        self.assertIsNone(result.title)
         self.assertEqual(mock_get.call_count, 1)
 
 
